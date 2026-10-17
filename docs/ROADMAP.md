@@ -25,8 +25,10 @@
 - [x] Phase 6 (implementation): parse DHCPACK mask/router/DNS/lease parameters and send a bounded ARP probe for the DHCP router.
 - [x] Phase 6 (physical validation): receive the matching ARP reply for the DHCP router.
 - [x] Phase 7 (implementation): send one validated ICMP echo request to the resolved DHCP router.
-- [ ] Phase 7 (physical validation): receive the matching ICMP echo reply from the DHCP router.
-- [ ] Phase 8: introduce retained DHCP parameters to a homebrew-only IPv4 stack, then test DNS and external connectivity.
+- [x] Phase 7 (physical validation): receive the matching ICMP echo reply from the DHCP router.
+- [x] Phase 8 (implementation): send and parse one UDP/DNS A query for `example.com` using the DHCP DNS server.
+- [ ] Phase 8 (physical validation): receive and parse the matching DNS response.
+- [ ] Phase 9: introduce retained DHCP parameters to a homebrew-only IPv4 stack, then test a bounded external transport.
 - [ ] Phase 7: only after successful homebrew networking, investigate a constrained Atmosphere sysmodule prototype.
 
 ## Acceptance criteria for the current artifact

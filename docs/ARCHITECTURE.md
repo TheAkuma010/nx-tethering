@@ -37,6 +37,8 @@ The two initial physical 0.8.0 attempts received valid RNDIS IPv6 multicast fram
 
 The subsequent 0.8.1 physical test completed the full guarded path: it obtained `10.248.48.177`, mask `255.255.255.0`, router/DNS `10.248.48.125`, and a 3599-second lease; it then received a matching ARP reply from the requested router. Version 0.9.0 uses that resolved MAC only to emit one ICMP echo request to the local DHCP router, accepting a reply only when IPv4 source/destination and ICMP identifier/sequence match. It does not contact an external address.
 
+The physical 0.9.0 run received the requested ICMP echo reply from the DHCP router, demonstrating a working local IPv4 packet exchange after DHCP and ARP. Version 0.10.0 then sends one UDP DNS A query for `example.com` to the DNS server supplied in the DHCPACK (normally the tether gateway), parses only a matching DNS response, and prints any A records. It still emits no HTTP request and does not configure Horizon.
+
 ## Alternatives considered
 
 | Candidate | What must be seen in Phase 2 | Decision status |

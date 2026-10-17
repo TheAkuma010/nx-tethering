@@ -104,7 +104,7 @@ static void log_result(const char *label, Result rc) {
 
 static void draw_header(void) {
     consoleClear();
-    printf("NX Tethering Diagnostics 0.9.0 (gateway ICMP probe)\n");
+    printf("NX Tethering Diagnostics 0.10.0 (DHCP DNS probe)\n");
     printf("NRO startup check passed. This app stays open until PLUS.\n");
     printf("A: scan | X: control | Y: endpoints | R: DHCP handshake | B: redraw | PLUS: exit\n");
     printf("USB detection is not proof of network connectivity.\n\n");
@@ -377,6 +377,48 @@ static size_t build_icmp_echo_request(u8 *out, const u8 mac[6], const DhcpLease 
     return RNDIS_PACKET_HEADER_SIZE + frame_size;
 }
 
+static size_t build_dns_query(u8 *out, const u8 mac[6], const DhcpLease *lease,
+                              const u8 gateway_mac[6]) {
+    const size_t ethernet_size = 14;
+    const size_t ipv4_size = 20;
+    const size_t udp_size = 8;
+    const size_t dns_size = 29; /* header + example.com A/IN question */
+    const size_t frame_size = ethernet_size + ipv4_size + udp_size + dns_size;
+    u8 *ethernet = out + RNDIS_PACKET_HEADER_SIZE;
+    u8 *ipv4 = ethernet + ethernet_size;
+    u8 *udp = ipv4 + ipv4_size;
+    u8 *dns = udp + udp_size;
+    static const u8 question[] = { 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0,
+                                   0, 1, 0, 1 };
+
+    memset(out, 0, 0x1000);
+    put_le32(out + 0, RNDIS_PACKET_MSG);
+    put_le32(out + 4, RNDIS_PACKET_HEADER_SIZE + frame_size);
+    put_le32(out + 8, RNDIS_PACKET_HEADER_SIZE - 8);
+    put_le32(out + 12, frame_size);
+    memcpy(ethernet, gateway_mac, 6);
+    memcpy(ethernet + 6, mac, 6);
+    put_be16(ethernet + 12, 0x0800);
+
+    ipv4[0] = 0x45;
+    put_be16(ipv4 + 2, ipv4_size + udp_size + dns_size);
+    put_be16(ipv4 + 4, 0x4e59);
+    ipv4[8] = 64;
+    ipv4[9] = 17;
+    memcpy(ipv4 + 12, lease->address, 4);
+    memcpy(ipv4 + 16, lease->dns, 4);
+    put_be16(ipv4 + 10, ipv4_checksum(ipv4, ipv4_size));
+    put_be16(udp, 53000);
+    put_be16(udp + 2, 53);
+    put_be16(udp + 4, udp_size + dns_size);
+
+    put_be16(dns, 0x4e59);
+    put_be16(dns + 2, 0x0100); /* recursion desired */
+    put_be16(dns + 4, 1);
+    memcpy(dns + 12, question, sizeof(question));
+    return RNDIS_PACKET_HEADER_SIZE + frame_size;
+}
+
 static void print_ipv4(const char *label, const u8 *address) {
     printf("%s%u.%u.%u.%u", label, address[0], address[1], address[2], address[3]);
 }
@@ -533,6 +575,61 @@ static bool inspect_icmp_echo_reply(const u8 *packet, u32 packet_size, const Dhc
     const u8 *icmp = ipv4 + ihl;
     if (icmp[0] != 0 || icmp[1] != 0 || get_be16(icmp + 4) != 0x4e58 || get_be16(icmp + 6) != 1) return false;
     printf("ICMP echo reply received from DHCP router.\n");
+    return true;
+}
+
+static const u8 *dns_skip_name(const u8 *cursor, const u8 *end) {
+    while (cursor < end) {
+        u8 length = *cursor++;
+        if (length == 0) return cursor;
+        if ((length & 0xc0) == 0xc0) return cursor < end ? cursor + 1 : NULL;
+        if ((length & 0xc0) != 0 || length > (size_t)(end - cursor)) return NULL;
+        cursor += length;
+    }
+    return NULL;
+}
+
+static bool inspect_dns_reply(const u8 *packet, u32 packet_size, const DhcpLease *lease) {
+    if (packet_size < RNDIS_PACKET_HEADER_SIZE) return false;
+    u32 data_offset = 8 + get_le32(packet + 8);
+    u32 data_length = get_le32(packet + 12);
+    if (get_le32(packet) != RNDIS_PACKET_MSG || data_offset > packet_size ||
+        data_length > packet_size - data_offset || data_length < 14 + 20 + 8 + 12) return false;
+    const u8 *ethernet = packet + data_offset;
+    if (get_be16(ethernet + 12) != 0x0800) return false;
+    const u8 *ipv4 = ethernet + 14;
+    u8 ihl = (ipv4[0] & 0x0f) * 4;
+    if (ihl < 20 || data_length < (u32)(14 + ihl + 8 + 12) || ipv4[9] != 17 ||
+        memcmp(ipv4 + 12, lease->dns, 4) != 0 || memcmp(ipv4 + 16, lease->address, 4) != 0) return false;
+    const u8 *udp = ipv4 + ihl;
+    if (get_be16(udp) != 53 || get_be16(udp + 2) != 53000) return false;
+    const u8 *dns = udp + 8;
+    const u8 *end = ethernet + data_length;
+    u16 flags = get_be16(dns + 2);
+    u16 questions = get_be16(dns + 4);
+    u16 answers = get_be16(dns + 6);
+    if (get_be16(dns) != 0x4e59 || (flags & 0x8000) == 0 || (flags & 0x000f) != 0) return false;
+    const u8 *cursor = dns + 12;
+    for (u16 i = 0; i < questions; i++) {
+        cursor = dns_skip_name(cursor, end);
+        if (!cursor || end - cursor < 4) return false;
+        cursor += 4;
+    }
+    printf("DNS response for example.com: %u answer(s).\n", answers);
+    for (u16 i = 0; i < answers; i++) {
+        cursor = dns_skip_name(cursor, end);
+        if (!cursor || end - cursor < 10) return false;
+        u16 type = get_be16(cursor);
+        u16 dns_class = get_be16(cursor + 2);
+        u16 data_length_field = get_be16(cursor + 8);
+        cursor += 10;
+        if (data_length_field > (size_t)(end - cursor)) return false;
+        if (type == 1 && dns_class == 1 && data_length_field == 4) {
+            print_ipv4("DNS A: ", cursor);
+            printf("\n");
+        }
+        cursor += data_length_field;
+    }
     return true;
 }
 
@@ -1261,6 +1358,44 @@ static void probe_dhcp_discover(void) {
         if (R_FAILED(rc)) break;
     }
     if (!got_echo) printf("No matching ICMP echo reply before timeout.\n");
+    if (!got_echo || !lease.has_dns) {
+        if (got_echo) printf("DHCPACK did not contain DNS option; DNS probe skipped.\n");
+        goto cleanup;
+    }
+
+    rc = usbHsEpPostBufferAsync(&input_endpoint, rx_buffer, 0x1000, 64, &xfer_id);
+    log_result("DNS post receive", rc); if (R_FAILED(rc)) goto cleanup;
+    size_t dns_size = build_dns_query(tx_buffer, mac, &lease, gateway_mac);
+    transferred = 0;
+    rc = usbHsEpPostBuffer(&output_endpoint, tx_buffer, dns_size, &transferred);
+    log_transfer_result("DNS example.com query", rc, transferred);
+    if (R_FAILED(rc) || transferred != dns_size) goto cleanup;
+    print_ipv4("DNS query example.com sent to ", lease.dns);
+    printf("; waiting up to 4 seconds for reply.\n");
+    bool got_dns = false;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        rc = eventWait(usbHsEpGetXferEvent(&input_endpoint), 2000000000ULL);
+        log_result("DNS receive wait", rc);
+        if (R_FAILED(rc)) continue;
+
+        UsbHsXferReport reports[2];
+        eventClear(usbHsEpGetXferEvent(&input_endpoint));
+        report_count = 0;
+        rc = usbHsEpGetXferReport(&input_endpoint, reports, 2, &report_count);
+        log_result("DNS receive report", rc);
+        if (R_FAILED(rc) || report_count == 0) continue;
+        printf("DNS bulk receive: result=0x%08X bytes=%u\n", reports[0].res, reports[0].transferredSize);
+        if (R_FAILED(reports[0].res)) break;
+        if (inspect_dns_reply(rx_buffer, reports[0].transferredSize, &lease)) {
+            got_dns = true;
+            break;
+        }
+        printf("Frame was not the requested DNS reply; reposting receive.\n");
+        rc = usbHsEpPostBufferAsync(&input_endpoint, rx_buffer, 0x1000, (u64)(65 + attempt), &xfer_id);
+        log_result("DNS repost receive", rc);
+        if (R_FAILED(rc)) break;
+    }
+    if (!got_dns) printf("No matching DNS response before timeout.\n");
 
 cleanup:
     if (output_open) usbHsEpClose(&output_endpoint);
