@@ -23,7 +23,7 @@ file nx-tethering.nro
 3. Open the app. The first screen must remain open.
 4. Press **A** with no accessory attached; capture the result codes. The screen redraws only after a button press; it must not continuously repeat text.
 5. Connect the Galaxy S23 Ultra with a data-capable USB-C cable, enable USB tethering, press **A**, and capture every VID:PID, interface class/subclass/protocol, endpoint, and result code.
-6. With the detected S23 still connected, press **X** once. This sends the reversible RNDIS initialize/control probe, reads its reply, sends RNDIS HALT, and closes the USB interface. Capture the result screen.
+6. With the detected S23 still connected, press **X** once. This sends RNDIS initialization and a read-only query for the adapter MAC address, then sends RNDIS HALT and closes the USB interface. It must first show `Acquiring RNDIS control interface ...`; capture the result screen.
 7. Press **PLUS** to exit. The app should return to hbmenu cleanly.
 
 Do not install this as a sysmodule and do not copy anything to NAND. `usb:hs` may refuse interfaces already owned by Horizon services; report the result rather than retrying aggressively.

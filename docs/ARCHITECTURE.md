@@ -17,9 +17,9 @@ No component above registers a NIC with Horizon. Therefore games and ordinary sy
 
 The physical S23 test selected **RNDIS**, subject to a control-plane validation. With USB tethering enabled, the Switch reports Samsung VID/PID `04E8:6863`, a control interface and a data interface (`0A/00/00`) with two 512-byte bulk endpoints. That control/data layout matches the Linux RNDIS gadget implementation and its RNDIS host matching rules. Without tethering, the query returns no interfaces.
 
-This establishes USB enumeration and protocol identification only. It does not yet establish RNDIS initialization, Ethernet-frame transfer, IP, or Internet connectivity.
+This establishes USB enumeration, protocol identification, and RNDIS initialization. It does not establish Ethernet-frame transfer, IP, or Internet connectivity.
 
-Version 0.2.0 adds a narrowly scoped validation path: **X** queries an available CDC-ACM/RNDIS control interface using a non-zero filter, acquires it, sends `REMOTE_NDIS_INITIALIZE_MSG` over CDC `SEND_ENCAPSULATED_COMMAND`, obtains `GET_ENCAPSULATED_RESPONSE`, then sends `REMOTE_NDIS_HALT_MSG` and closes the interface. It does not open either bulk data endpoint or set a packet filter, so it cannot carry user traffic. A successful `REMOTE_NDIS_INITIALIZE_CMPLT` with status zero is the next acceptance criterion.
+The physical test passed the initial control-plane acceptance criterion: **X** acquired interface 0, sent `REMOTE_NDIS_INITIALIZE_MSG` (24 bytes), received `REMOTE_NDIS_INITIALIZE_CMPLT` (52 bytes, request 1, status 0), sent `REMOTE_NDIS_HALT_MSG` (12 bytes), and closed the interface. Version 0.3.0 additionally sends a read-only `RNDIS_OID_802_3_CURRENT_ADDRESS` query after initialization. It still does not open a bulk endpoint or set a packet filter, so it cannot carry user traffic.
 
 ## Alternatives considered
 
@@ -30,7 +30,7 @@ Version 0.2.0 adds a narrowly scoped validation path: **X** queries an available
 | CDC-NCM | NCM functional descriptors | Not exposed by this S23 test. |
 | Custom Android companion protocol | A documented vendor interface and two bulk endpoints | Fallback; a normal app may not configure arbitrary USB gadget functions. |
 
-The app only reads descriptors today. It neither acquires an interface nor sends transfers, avoiding guesses about a protocol.
+The app now uses control transfers only for the validated RNDIS probe. It has not opened a data endpoint, enabled packet filtering, transmitted an Ethernet frame, or configured IP.
 
 ## Future system integration
 

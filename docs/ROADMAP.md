@@ -9,7 +9,9 @@
 - [x] Phase 1/2 physical acceptance: NRO runs; the S23 is absent without tethering and exposes two interfaces with tethering enabled.
 - [x] Phase 3 (selection): select RNDIS for the S23 based on its control/data interface signature.
 - [x] Phase 3 (implementation): add the user-triggered, reversible RNDIS initialize/response/HALT control probe.
-- [ ] Phase 3 (physical validation): run the probe with the S23 and capture its response/status.
+- [x] Phase 3 (physical validation): RNDIS initialization completed successfully on the S23 and HALT was accepted.
+- [x] Phase 3 (implementation): add a read-only RNDIS `CURRENT_ADDRESS` query after successful initialization.
+- [ ] Phase 3 (physical validation): run the 0.3.0 MAC-query probe and capture its response.
 - [ ] Phases 4-6: packet transport, IP configuration, and real connectivity tests.
 - [ ] Phase 7: only after successful homebrew networking, investigate a constrained Atmosphere sysmodule prototype.
 
