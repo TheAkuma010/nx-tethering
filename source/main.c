@@ -12,8 +12,15 @@
 #define RNDIS_HALT_MSG 0x00000003U
 #define RNDIS_QUERY_MSG 0x00000004U
 #define RNDIS_QUERY_CMPLT 0x80000004U
+#define RNDIS_SET_MSG 0x00000005U
+#define RNDIS_SET_CMPLT 0x80000005U
 #define RNDIS_STATUS_SUCCESS 0x00000000U
 #define RNDIS_OID_802_3_CURRENT_ADDRESS 0x01010102U
+#define RNDIS_OID_GEN_CURRENT_PACKET_FILTER 0x0001010EU
+#define RNDIS_DEFAULT_PACKET_FILTER 0x0000000FU
+#define RNDIS_PACKET_MSG 0x00000001U
+#define RNDIS_PACKET_HEADER_SIZE 44U
+#define DHCP_PAYLOAD_SIZE 300U
 
 typedef struct {
     u32 message_type;
@@ -56,6 +63,30 @@ typedef struct {
     u32 information_buffer_offset;
 } RndisQueryComplete;
 
+typedef struct {
+    u32 message_type;
+    u32 message_length;
+    u32 request_id;
+    u32 oid;
+    u32 information_buffer_length;
+    u32 information_buffer_offset;
+    u32 device_vc_handle;
+    u32 packet_filter;
+} RndisSetPacketFilterMessage;
+
+typedef struct {
+    u32 message_type;
+    u32 message_length;
+    u32 request_id;
+    u32 status;
+} RndisSetComplete;
+
+typedef struct {
+    u8 address[4];
+    u8 server[4];
+    bool has_server;
+} DhcpLease;
+
 static char g_log[LOG_LINES][LOG_LINE_SIZE];
 static unsigned int g_log_head;
 
@@ -66,9 +97,9 @@ static void log_result(const char *label, Result rc) {
 
 static void draw_header(void) {
     consoleClear();
-    printf("NX Tethering Diagnostics 0.3.0\n");
+    printf("NX Tethering Diagnostics 0.7.0 (DHCP request/ack validation)\n");
     printf("NRO startup check passed. This app stays open until PLUS.\n");
-    printf("A: scan | X: RNDIS control + MAC probe | B: redraw | PLUS: exit\n");
+    printf("A: scan | X: control | Y: endpoints | R: DHCP handshake | B: redraw | PLUS: exit\n");
     printf("USB detection is not proof of network connectivity.\n\n");
 }
 
@@ -133,6 +164,244 @@ static void log_transfer_result(const char *label, Result rc, u32 transferred) {
     g_log_head++;
 }
 
+static void put_be16(u8 *out, u16 value) {
+    out[0] = (u8)(value >> 8);
+    out[1] = (u8)value;
+}
+
+static void put_be32(u8 *out, u32 value) {
+    out[0] = (u8)(value >> 24);
+    out[1] = (u8)(value >> 16);
+    out[2] = (u8)(value >> 8);
+    out[3] = (u8)value;
+}
+
+static void put_le32(u8 *out, u32 value) {
+    out[0] = (u8)value;
+    out[1] = (u8)(value >> 8);
+    out[2] = (u8)(value >> 16);
+    out[3] = (u8)(value >> 24);
+}
+
+static u16 get_be16(const u8 *in) {
+    return ((u16)in[0] << 8) | in[1];
+}
+
+static u32 get_le32(const u8 *in) {
+    return (u32)in[0] | ((u32)in[1] << 8) | ((u32)in[2] << 16) | ((u32)in[3] << 24);
+}
+
+static u16 ipv4_checksum(const u8 *header, size_t length) {
+    u32 sum = 0;
+    for (size_t i = 0; i < length; i += 2)
+        sum += ((u16)header[i] << 8) | header[i + 1];
+    while (sum >> 16) sum = (sum & 0xffffU) + (sum >> 16);
+    return (u16)~sum;
+}
+
+static size_t build_dhcp_discover(u8 *out, const u8 mac[6]) {
+    const size_t ethernet_size = 14;
+    const size_t ipv4_size = 20;
+    const size_t udp_size = 8;
+    const size_t frame_size = ethernet_size + ipv4_size + udp_size + DHCP_PAYLOAD_SIZE;
+    u8 *ethernet = out + RNDIS_PACKET_HEADER_SIZE;
+    u8 *ipv4 = ethernet + ethernet_size;
+    u8 *udp = ipv4 + ipv4_size;
+    u8 *dhcp = udp + udp_size;
+    u8 *options;
+
+    memset(out, 0, 0x1000);
+    put_le32(out + 0, RNDIS_PACKET_MSG);
+    put_le32(out + 4, RNDIS_PACKET_HEADER_SIZE + frame_size);
+    put_le32(out + 8, RNDIS_PACKET_HEADER_SIZE - 8);
+    put_le32(out + 12, frame_size);
+
+    memset(ethernet, 0xff, 6);
+    memcpy(ethernet + 6, mac, 6);
+    put_be16(ethernet + 12, 0x0800);
+
+    ipv4[0] = 0x45;
+    put_be16(ipv4 + 2, ipv4_size + udp_size + DHCP_PAYLOAD_SIZE);
+    put_be16(ipv4 + 6, 0x8000);
+    ipv4[8] = 64;
+    ipv4[9] = 17;
+    memset(ipv4 + 12, 0, 4);
+    memset(ipv4 + 16, 0xff, 4);
+    put_be16(ipv4 + 10, ipv4_checksum(ipv4, ipv4_size));
+
+    put_be16(udp, 68);
+    put_be16(udp + 2, 67);
+    put_be16(udp + 4, udp_size + DHCP_PAYLOAD_SIZE);
+    /* A zero UDP checksum is permitted for IPv4. */
+
+    dhcp[0] = 1;  /* BOOTREQUEST */
+    dhcp[1] = 1;  /* Ethernet */
+    dhcp[2] = 6;
+    put_be32(dhcp + 4, 0x4e585431U); /* "NXT1" */
+    put_be16(dhcp + 10, 0x8000);     /* request broadcast reply */
+    memcpy(dhcp + 28, mac, 6);
+    put_be32(dhcp + 236, 0x63825363U);
+    options = dhcp + 240;
+    *options++ = 53; *options++ = 1; *options++ = 1; /* DHCPDISCOVER */
+    *options++ = 61; *options++ = 7; *options++ = 1;
+    memcpy(options, mac, 6); options += 6;
+    *options++ = 55; *options++ = 4; /* subnet, router, DNS, lease */
+    *options++ = 1; *options++ = 3; *options++ = 6; *options++ = 51;
+    *options++ = 255;
+    return RNDIS_PACKET_HEADER_SIZE + frame_size;
+}
+
+static size_t build_dhcp_request(u8 *out, const u8 mac[6], const DhcpLease *lease) {
+    const size_t ethernet_size = 14;
+    const size_t ipv4_size = 20;
+    const size_t udp_size = 8;
+    const size_t frame_size = ethernet_size + ipv4_size + udp_size + DHCP_PAYLOAD_SIZE;
+    u8 *ethernet = out + RNDIS_PACKET_HEADER_SIZE;
+    u8 *ipv4 = ethernet + ethernet_size;
+    u8 *udp = ipv4 + ipv4_size;
+    u8 *dhcp = udp + udp_size;
+    u8 *options;
+
+    memset(out, 0, 0x1000);
+    put_le32(out + 0, RNDIS_PACKET_MSG);
+    put_le32(out + 4, RNDIS_PACKET_HEADER_SIZE + frame_size);
+    put_le32(out + 8, RNDIS_PACKET_HEADER_SIZE - 8);
+    put_le32(out + 12, frame_size);
+
+    memset(ethernet, 0xff, 6);
+    memcpy(ethernet + 6, mac, 6);
+    put_be16(ethernet + 12, 0x0800);
+
+    ipv4[0] = 0x45;
+    put_be16(ipv4 + 2, ipv4_size + udp_size + DHCP_PAYLOAD_SIZE);
+    put_be16(ipv4 + 6, 0x8000);
+    ipv4[8] = 64;
+    ipv4[9] = 17;
+    memset(ipv4 + 12, 0, 4);
+    memset(ipv4 + 16, 0xff, 4);
+    put_be16(ipv4 + 10, ipv4_checksum(ipv4, ipv4_size));
+
+    put_be16(udp, 68);
+    put_be16(udp + 2, 67);
+    put_be16(udp + 4, udp_size + DHCP_PAYLOAD_SIZE);
+
+    dhcp[0] = 1;  /* BOOTREQUEST */
+    dhcp[1] = 1;  /* Ethernet */
+    dhcp[2] = 6;
+    put_be32(dhcp + 4, 0x4e585431U); /* Must match the DISCOVER transaction. */
+    put_be16(dhcp + 10, 0x8000);
+    memcpy(dhcp + 28, mac, 6);
+    put_be32(dhcp + 236, 0x63825363U);
+    options = dhcp + 240;
+    *options++ = 53; *options++ = 1; *options++ = 3; /* DHCPREQUEST */
+    *options++ = 50; *options++ = 4; /* requested address */
+    memcpy(options, lease->address, 4); options += 4;
+    *options++ = 54; *options++ = 4; /* selected server */
+    memcpy(options, lease->server, 4); options += 4;
+    *options++ = 61; *options++ = 7; *options++ = 1;
+    memcpy(options, mac, 6); options += 6;
+    *options++ = 55; *options++ = 4;
+    *options++ = 1; *options++ = 3; *options++ = 6; *options++ = 51;
+    *options++ = 255;
+    return RNDIS_PACKET_HEADER_SIZE + frame_size;
+}
+
+static void print_ipv4(const char *label, const u8 *address) {
+    printf("%s%u.%u.%u.%u", label, address[0], address[1], address[2], address[3]);
+}
+
+static u8 inspect_dhcp_reply(const u8 *packet, u32 packet_size, DhcpLease *lease) {
+    printf("RX raw (%u bytes):", packet_size);
+    u32 dump_length = packet_size < 32 ? packet_size : 32;
+    for (u32 i = 0; i < dump_length; i++) printf(" %02X", packet[i]);
+    printf("\n");
+    if (packet_size < RNDIS_PACKET_HEADER_SIZE) {
+        printf("Received bulk data is too short for an RNDIS packet.\n");
+        return 0;
+    }
+    u32 data_offset = 8 + get_le32(packet + 8);
+    u32 data_length = get_le32(packet + 12);
+    if (get_le32(packet) != RNDIS_PACKET_MSG || data_offset > packet_size ||
+        data_length > packet_size - data_offset || data_length < 14) {
+        printf("Received bulk data is not a complete RNDIS Ethernet packet.\n");
+        return 0;
+    }
+    const u8 *ethernet = packet + data_offset;
+    u16 ether_type = get_be16(ethernet + 12);
+    printf("RNDIS Ethernet: %02X:%02X:%02X:%02X:%02X:%02X -> %02X:%02X:%02X:%02X:%02X:%02X type=0x%04X\n",
+           ethernet[6], ethernet[7], ethernet[8], ethernet[9], ethernet[10], ethernet[11],
+           ethernet[0], ethernet[1], ethernet[2], ethernet[3], ethernet[4], ethernet[5], ether_type);
+    if (ether_type == 0x0806) {
+        if (data_length >= 14 + 28) {
+            const u8 *arp = ethernet + 14;
+            printf("ARP opcode=%u sender=%u.%u.%u.%u target=%u.%u.%u.%u\n", get_be16(arp + 6),
+                   arp[14], arp[15], arp[16], arp[17], arp[24], arp[25], arp[26], arp[27]);
+        }
+        return 0;
+    }
+    if (ether_type == 0x86dd) {
+        if (data_length >= 14 + 40) {
+            const u8 *ipv6 = ethernet + 14;
+            u8 next_header = ipv6[6];
+            printf("IPv6 next-header=%u", next_header);
+            if (next_header == 58 && data_length >= 14 + 40 + 1)
+                printf(" ICMPv6 type=%u", ipv6[40]);
+            printf(" (not DHCPv4).\n");
+        }
+        return 0;
+    }
+    if (ether_type != 0x0800) {
+        printf("Received Ethernet type 0x%04X (not IPv4/DHCP).\n", ether_type);
+        return 0;
+    }
+    const u8 *ipv4 = ethernet + 14;
+    u8 ihl = (ipv4[0] & 0x0f) * 4;
+    if (ihl < 20 || data_length < (u32)(14 + ihl + 8) || ipv4[9] != 17) {
+        printf("Received IPv4 packet is not a DHCP UDP candidate.\n");
+        return 0;
+    }
+    const u8 *udp = ipv4 + ihl;
+    if (data_length < (u32)(14 + ihl + 8 + 240)) {
+        printf("Received UDP %u -> %u, too short for DHCP/BOOTP.\n", get_be16(udp), get_be16(udp + 2));
+        return 0;
+    }
+    if (get_be16(udp) != 67 || get_be16(udp + 2) != 68) {
+        printf("Received UDP %u -> %u (not DHCP reply).\n", get_be16(udp), get_be16(udp + 2));
+        return 0;
+    }
+    const u8 *dhcp = udp + 8;
+    if (dhcp[0] != 2 || memcmp(dhcp + 236, "\x63\x82\x53\x63", 4) != 0) {
+        printf("Received UDP payload is not a DHCP BOOTREPLY.\n");
+        return 0;
+    }
+    memcpy(lease->address, dhcp + 16, sizeof(lease->address));
+    lease->has_server = false;
+    print_ipv4("DHCP address: ", lease->address);
+    printf("\n");
+    const u8 *option = dhcp + 240;
+    const u8 *end = packet + data_offset + data_length;
+    u8 message_type = 0;
+    while (option < end && *option != 255) {
+        u8 code = *option++;
+        if (code == 0) continue;
+        if (option >= end) break;
+        u8 length = *option++;
+        if (length > (size_t)(end - option)) break;
+        if (code == 53 && length == 1) {
+            message_type = option[0];
+            printf("DHCP message type: %u\n", message_type);
+        }
+        else if (code == 54 && length == 4) {
+            memcpy(lease->server, option, sizeof(lease->server));
+            lease->has_server = true;
+            print_ipv4("DHCP server: ", lease->server);
+            printf("\n");
+        }
+        option += length;
+    }
+    return message_type;
+}
+
 static void probe_rndis(void) {
     UsbHsInterfaceFilter filter;
     UsbHsInterfaceFilter query_filter;
@@ -161,12 +430,23 @@ static void probe_rndis(void) {
         .information_buffer_offset = 20,
         .device_vc_handle = 0,
     };
+    RndisSetPacketFilterMessage enable_filter = {
+        .message_type = RNDIS_SET_MSG,
+        .message_length = sizeof(RndisSetPacketFilterMessage),
+        .request_id = 3,
+        .oid = RNDIS_OID_GEN_CURRENT_PACKET_FILTER,
+        .information_buffer_length = sizeof(u32),
+        .information_buffer_offset = 20,
+        .device_vc_handle = 0,
+        .packet_filter = RNDIS_DEFAULT_PACKET_FILTER,
+    };
     s32 count = 0;
     s32 available_count = 0;
     int control_index = -1;
     Result rc;
     u32 transferred = 0;
     void *buffer = NULL;
+    bool packet_filter_enabled = false;
 
     memset(&filter, 0, sizeof(filter));
     memset(&query_filter, 0, sizeof(query_filter));
@@ -313,7 +593,7 @@ static void probe_rndis(void) {
             const u8 *mac = (const u8 *)buffer + data_offset;
             printf("RNDIS adapter MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-            printf("Control plane validated. Bulk data transport is next.\n");
+            printf("RNDIS MAC query validated; enabling packet filter briefly.\n");
         } else {
             printf("RNDIS MAC response was invalid: type=0x%08X len=%u status=0x%08X data=%u@%u\n",
                    response.message_type, response.message_length, response.status,
@@ -323,8 +603,66 @@ static void probe_rndis(void) {
         printf("RNDIS MAC response was too short (%u bytes).\n", transferred);
     }
 
+    if (R_FAILED(rc) || transferred < sizeof(RndisQueryComplete)) goto cleanup;
+    RndisQueryComplete mac_response;
+    memcpy(&mac_response, buffer, sizeof(mac_response));
+    if (mac_response.message_type != RNDIS_QUERY_CMPLT ||
+        mac_response.request_id != mac_query.request_id ||
+        mac_response.status != RNDIS_STATUS_SUCCESS)
+        goto cleanup;
+
+    memcpy(buffer, &enable_filter, sizeof(enable_filter));
+    transferred = 0;
+    rc = usbHsIfCtrlXfer(&session,
+                         USB_ENDPOINT_OUT | USB_REQUEST_TYPE_CLASS | USB_RECIPIENT_INTERFACE,
+                         0, 0, control_desc.bInterfaceNumber,
+                         sizeof(enable_filter), buffer, &transferred);
+    log_transfer_result("RNDIS SET PACKET_FILTER", rc, transferred);
+    if (R_FAILED(rc) || transferred != sizeof(enable_filter)) goto cleanup;
+
+    memset(buffer, 0, 0x1000);
+    transferred = 0;
+    rc = usbHsIfCtrlXfer(&session,
+                         USB_ENDPOINT_IN | USB_REQUEST_TYPE_CLASS | USB_RECIPIENT_INTERFACE,
+                         1, 0, control_desc.bInterfaceNumber,
+                         0x1000, buffer, &transferred);
+    log_transfer_result("RNDIS GET FILTER RESPONSE", rc, transferred);
+    if (R_FAILED(rc) || transferred < sizeof(RndisSetComplete)) goto cleanup;
+    RndisSetComplete filter_response;
+    memcpy(&filter_response, buffer, sizeof(filter_response));
+    if (filter_response.message_type != RNDIS_SET_CMPLT ||
+        filter_response.request_id != enable_filter.request_id ||
+        filter_response.status != RNDIS_STATUS_SUCCESS) {
+        printf("RNDIS filter enable was not accepted.\n");
+        goto cleanup;
+    }
+    packet_filter_enabled = true;
+    printf("RNDIS packet filter enabled (0x%08X); disabling it during cleanup.\n",
+           enable_filter.packet_filter);
+
 cleanup:
     if (buffer != NULL) {
+        if (packet_filter_enabled) {
+            RndisSetPacketFilterMessage disable_filter = enable_filter;
+            disable_filter.request_id = 4;
+            disable_filter.packet_filter = 0;
+            memcpy(buffer, &disable_filter, sizeof(disable_filter));
+            transferred = 0;
+            rc = usbHsIfCtrlXfer(&session,
+                                 USB_ENDPOINT_OUT | USB_REQUEST_TYPE_CLASS | USB_RECIPIENT_INTERFACE,
+                                 0, 0, control_desc.bInterfaceNumber,
+                                 sizeof(disable_filter), buffer, &transferred);
+            log_transfer_result("RNDIS CLEAR PACKET_FILTER", rc, transferred);
+            if (R_SUCCEEDED(rc) && transferred == sizeof(disable_filter)) {
+                memset(buffer, 0, 0x1000);
+                transferred = 0;
+                rc = usbHsIfCtrlXfer(&session,
+                                     USB_ENDPOINT_IN | USB_REQUEST_TYPE_CLASS | USB_RECIPIENT_INTERFACE,
+                                     1, 0, control_desc.bInterfaceNumber,
+                                     0x1000, buffer, &transferred);
+                log_transfer_result("RNDIS GET CLEAR RESPONSE", rc, transferred);
+            }
+        }
         memcpy(buffer, &halt, sizeof(halt));
         transferred = 0;
         rc = usbHsIfCtrlXfer(&session,
@@ -335,6 +673,405 @@ cleanup:
         free(buffer);
     }
     usbHsIfClose(&session);
+    print_recent_results();
+}
+
+static bool is_bulk_endpoint(const struct usb_endpoint_descriptor *desc) {
+    return desc->bLength != 0 &&
+           (desc->bmAttributes & USB_TRANSFER_TYPE_MASK) == USB_TRANSFER_TYPE_BULK;
+}
+
+static void probe_rndis_bulk_endpoints(void) {
+    UsbHsInterfaceFilter discovery_filter;
+    UsbHsInterfaceFilter data_filter;
+    UsbHsInterface interfaces[MAX_INTERFACES];
+    UsbHsInterface available[MAX_INTERFACES];
+    UsbHsClientIfSession session;
+    UsbHsClientEpSession input_endpoint;
+    UsbHsClientEpSession output_endpoint;
+    struct usb_device_descriptor device_desc;
+    struct usb_interface_descriptor data_desc;
+    struct usb_endpoint_descriptor input_desc;
+    struct usb_endpoint_descriptor output_desc;
+    s32 count = 0;
+    s32 available_count = 0;
+    int data_index = -1;
+    Result rc;
+    bool input_open = false;
+    bool output_open = false;
+
+    memset(&discovery_filter, 0, sizeof(discovery_filter));
+    memset(&data_filter, 0, sizeof(data_filter));
+    memset(interfaces, 0, sizeof(interfaces));
+    memset(available, 0, sizeof(available));
+    memset(&session, 0, sizeof(session));
+    memset(&input_endpoint, 0, sizeof(input_endpoint));
+    memset(&output_endpoint, 0, sizeof(output_endpoint));
+    memset(&input_desc, 0, sizeof(input_desc));
+    memset(&output_desc, 0, sizeof(output_desc));
+
+    rc = usbHsQueryAllInterfaces(&discovery_filter, interfaces, sizeof(interfaces), &count);
+    log_result("usbHsQueryAllInterfaces", rc);
+    if (R_FAILED(rc) || count <= 0) goto unavailable;
+
+    for (int i = 0; i < count && i < MAX_INTERFACES; i++) {
+        if (is_rndis_data(&interfaces[i])) {
+            data_index = i;
+            break;
+        }
+    }
+    if (data_index < 0) goto unavailable;
+
+    memcpy(&device_desc, &interfaces[data_index].device_desc, sizeof(device_desc));
+    memcpy(&data_desc, &interfaces[data_index].inf.interface_desc, sizeof(data_desc));
+    data_filter.Flags = UsbHsInterfaceFilterFlags_idVendor |
+                        UsbHsInterfaceFilterFlags_idProduct |
+                        UsbHsInterfaceFilterFlags_bInterfaceClass |
+                        UsbHsInterfaceFilterFlags_bInterfaceSubClass |
+                        UsbHsInterfaceFilterFlags_bInterfaceProtocol;
+    data_filter.idVendor = device_desc.idVendor;
+    data_filter.idProduct = device_desc.idProduct;
+    data_filter.bInterfaceClass = data_desc.bInterfaceClass;
+    data_filter.bInterfaceSubClass = data_desc.bInterfaceSubClass;
+    data_filter.bInterfaceProtocol = data_desc.bInterfaceProtocol;
+    rc = usbHsQueryAvailableInterfaces(&data_filter, available, sizeof(available), &available_count);
+    log_result("usbHsQueryAvailableDataIf", rc);
+    if (R_FAILED(rc) || available_count <= 0) goto unavailable;
+
+    data_index = -1;
+    for (int i = 0; i < available_count && i < MAX_INTERFACES; i++) {
+        if (is_rndis_data(&available[i])) {
+            data_index = i;
+            break;
+        }
+    }
+    if (data_index < 0) goto unavailable;
+
+    for (int i = 0; i < 15; i++) {
+        struct usb_endpoint_descriptor candidate;
+        memcpy(&candidate, &available[data_index].inf.input_endpoint_descs[i], sizeof(candidate));
+        if (is_bulk_endpoint(&candidate)) {
+            input_desc = candidate;
+            break;
+        }
+    }
+    for (int i = 0; i < 15; i++) {
+        struct usb_endpoint_descriptor candidate;
+        memcpy(&candidate, &available[data_index].inf.output_endpoint_descs[i], sizeof(candidate));
+        if (is_bulk_endpoint(&candidate)) {
+            output_desc = candidate;
+            break;
+        }
+    }
+    if (input_desc.bLength == 0 || output_desc.bLength == 0) {
+        printf("RNDIS data interface lacks the required bulk IN/OUT endpoints.\n");
+        print_recent_results();
+        return;
+    }
+
+    printf("Acquiring RNDIS data interface %u (ID %d).\n",
+           available[data_index].inf.interface_desc.bInterfaceNumber,
+           available[data_index].inf.ID);
+    rc = usbHsAcquireUsbIf(&session, &available[data_index]);
+    log_result("usbHsAcquireDataIf", rc);
+    if (R_FAILED(rc)) {
+        print_recent_results();
+        return;
+    }
+
+    rc = usbHsIfOpenUsbEp(&session, &input_endpoint, 1, 0x1000, &input_desc);
+    log_result("usbHsIfOpenUsbEp(IN)", rc);
+    if (R_FAILED(rc)) goto cleanup;
+    input_open = true;
+
+    rc = usbHsIfOpenUsbEp(&session, &output_endpoint, 1, 0x1000, &output_desc);
+    log_result("usbHsIfOpenUsbEp(OUT)", rc);
+    if (R_FAILED(rc)) goto cleanup;
+    output_open = true;
+
+    printf("Bulk endpoints opened: IN 0x%02X, OUT 0x%02X.\n",
+           input_desc.bEndpointAddress, output_desc.bEndpointAddress);
+    printf("No packets were sent and no RNDIS packet filter was enabled.\n");
+
+cleanup:
+    if (output_open) usbHsEpClose(&output_endpoint);
+    if (input_open) usbHsEpClose(&input_endpoint);
+    usbHsIfClose(&session);
+    print_recent_results();
+    return;
+
+unavailable:
+    printf("RNDIS data interface is not available to this homebrew.\n");
+    print_recent_results();
+}
+
+static void probe_dhcp_discover(void) {
+    UsbHsInterfaceFilter no_filter, control_filter, data_filter;
+    UsbHsInterface interfaces[MAX_INTERFACES], available[MAX_INTERFACES];
+    UsbHsClientIfSession control_session, data_session;
+    UsbHsClientEpSession input_endpoint, output_endpoint;
+    struct usb_interface_descriptor control_desc, data_desc;
+    struct usb_device_descriptor device_desc;
+    struct usb_endpoint_descriptor input_desc = {0}, output_desc = {0};
+    RndisInitializeMessage init = { RNDIS_INITIALIZE_MSG, sizeof(RndisInitializeMessage), 10, 1, 0, 0x4000 };
+    RndisQueryMessage mac_query = { RNDIS_QUERY_MSG, sizeof(RndisQueryMessage), 11,
+                                    RNDIS_OID_802_3_CURRENT_ADDRESS, 0, 20, 0 };
+    RndisSetPacketFilterMessage set_filter = { RNDIS_SET_MSG, sizeof(RndisSetPacketFilterMessage), 12,
+                                                RNDIS_OID_GEN_CURRENT_PACKET_FILTER, sizeof(u32), 20, 0,
+                                                RNDIS_DEFAULT_PACKET_FILTER };
+    RndisHaltMessage halt = { RNDIS_HALT_MSG, sizeof(RndisHaltMessage), 10 };
+    s32 count = 0, available_count = 0;
+    int index = -1;
+    Result rc;
+    u32 transferred = 0, xfer_id = 0, report_count = 0;
+    void *control_buffer = NULL, *rx_buffer = NULL, *tx_buffer = NULL;
+    bool control_active = false, data_active = false, input_open = false, output_open = false;
+    bool filter_enabled = false;
+    u8 mac[6];
+    DhcpLease lease = {0};
+
+    memset(&no_filter, 0, sizeof(no_filter));
+    memset(&control_filter, 0, sizeof(control_filter));
+    memset(&data_filter, 0, sizeof(data_filter));
+    memset(interfaces, 0, sizeof(interfaces));
+    memset(available, 0, sizeof(available));
+    memset(&control_session, 0, sizeof(control_session));
+    memset(&data_session, 0, sizeof(data_session));
+    memset(&input_endpoint, 0, sizeof(input_endpoint));
+    memset(&output_endpoint, 0, sizeof(output_endpoint));
+
+    rc = usbHsQueryAllInterfaces(&no_filter, interfaces, sizeof(interfaces), &count);
+    log_result("DHCP query interfaces", rc);
+    if (R_FAILED(rc)) goto cleanup;
+    for (int i = 0; i < count && i < MAX_INTERFACES; i++) {
+        if (is_rndis_control(&interfaces[i])) { index = i; break; }
+    }
+    if (index < 0) { printf("No RNDIS control interface found.\n"); goto cleanup; }
+    memcpy(&control_desc, &interfaces[index].inf.interface_desc, sizeof(control_desc));
+    memcpy(&device_desc, &interfaces[index].device_desc, sizeof(device_desc));
+    control_filter.Flags = UsbHsInterfaceFilterFlags_idVendor | UsbHsInterfaceFilterFlags_idProduct |
+                           UsbHsInterfaceFilterFlags_bInterfaceClass | UsbHsInterfaceFilterFlags_bInterfaceSubClass |
+                           UsbHsInterfaceFilterFlags_bInterfaceProtocol;
+    control_filter.idVendor = device_desc.idVendor;
+    control_filter.idProduct = device_desc.idProduct;
+    control_filter.bInterfaceClass = control_desc.bInterfaceClass;
+    control_filter.bInterfaceSubClass = control_desc.bInterfaceSubClass;
+    control_filter.bInterfaceProtocol = control_desc.bInterfaceProtocol;
+    rc = usbHsQueryAvailableInterfaces(&control_filter, available, sizeof(available), &available_count);
+    log_result("DHCP query control", rc);
+    if (R_FAILED(rc) || available_count <= 0) goto cleanup;
+    rc = usbHsAcquireUsbIf(&control_session, &available[0]);
+    log_result("DHCP acquire control", rc);
+    if (R_FAILED(rc)) goto cleanup;
+    control_active = true;
+
+    control_buffer = memalign(0x1000, 0x1000);
+    rx_buffer = memalign(0x1000, 0x1000);
+    tx_buffer = memalign(0x1000, 0x1000);
+    if (!control_buffer || !rx_buffer || !tx_buffer) {
+        log_result("DHCP aligned allocation", MAKERESULT(Module_Libnx, LibnxError_OutOfMemory));
+        goto cleanup;
+    }
+    memcpy(control_buffer, &init, sizeof(init));
+    rc = usbHsIfCtrlXfer(&control_session, USB_ENDPOINT_OUT | USB_REQUEST_TYPE_CLASS | USB_RECIPIENT_INTERFACE,
+                         0, 0, control_desc.bInterfaceNumber, sizeof(init), control_buffer, &transferred);
+    log_transfer_result("DHCP RNDIS INIT", rc, transferred);
+    if (R_FAILED(rc) || transferred != sizeof(init)) goto cleanup;
+    memset(control_buffer, 0, 0x1000); transferred = 0;
+    rc = usbHsIfCtrlXfer(&control_session, USB_ENDPOINT_IN | USB_REQUEST_TYPE_CLASS | USB_RECIPIENT_INTERFACE,
+                         1, 0, control_desc.bInterfaceNumber, 0x1000, control_buffer, &transferred);
+    log_transfer_result("DHCP GET INIT RESPONSE", rc, transferred);
+    if (R_FAILED(rc) || transferred < sizeof(RndisInitializeCompletePrefix)) goto cleanup;
+    RndisInitializeCompletePrefix init_response;
+    memcpy(&init_response, control_buffer, sizeof(init_response));
+    if (init_response.message_type != RNDIS_INITIALIZE_CMPLT || init_response.status != RNDIS_STATUS_SUCCESS) goto cleanup;
+
+    memcpy(control_buffer, &mac_query, sizeof(mac_query)); transferred = 0;
+    rc = usbHsIfCtrlXfer(&control_session, USB_ENDPOINT_OUT | USB_REQUEST_TYPE_CLASS | USB_RECIPIENT_INTERFACE,
+                         0, 0, control_desc.bInterfaceNumber, sizeof(mac_query), control_buffer, &transferred);
+    log_transfer_result("DHCP QUERY MAC", rc, transferred);
+    if (R_FAILED(rc) || transferred != sizeof(mac_query)) goto cleanup;
+    memset(control_buffer, 0, 0x1000); transferred = 0;
+    rc = usbHsIfCtrlXfer(&control_session, USB_ENDPOINT_IN | USB_REQUEST_TYPE_CLASS | USB_RECIPIENT_INTERFACE,
+                         1, 0, control_desc.bInterfaceNumber, 0x1000, control_buffer, &transferred);
+    log_transfer_result("DHCP GET MAC", rc, transferred);
+    if (R_FAILED(rc) || transferred < sizeof(RndisQueryComplete)) goto cleanup;
+    RndisQueryComplete mac_response;
+    memcpy(&mac_response, control_buffer, sizeof(mac_response));
+    size_t mac_offset = 8 + mac_response.information_buffer_offset;
+    if (mac_response.message_type != RNDIS_QUERY_CMPLT || mac_response.status != RNDIS_STATUS_SUCCESS ||
+        mac_response.information_buffer_length != 6 || mac_offset > transferred || 6 > transferred - mac_offset) goto cleanup;
+    memcpy(mac, (u8 *)control_buffer + mac_offset, sizeof(mac));
+    printf("DHCP using RNDIS MAC %02X:%02X:%02X:%02X:%02X:%02X\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+    memcpy(control_buffer, &set_filter, sizeof(set_filter)); transferred = 0;
+    rc = usbHsIfCtrlXfer(&control_session, USB_ENDPOINT_OUT | USB_REQUEST_TYPE_CLASS | USB_RECIPIENT_INTERFACE,
+                         0, 0, control_desc.bInterfaceNumber, sizeof(set_filter), control_buffer, &transferred);
+    log_transfer_result("DHCP SET FILTER", rc, transferred);
+    if (R_FAILED(rc) || transferred != sizeof(set_filter)) goto cleanup;
+    memset(control_buffer, 0, 0x1000); transferred = 0;
+    rc = usbHsIfCtrlXfer(&control_session, USB_ENDPOINT_IN | USB_REQUEST_TYPE_CLASS | USB_RECIPIENT_INTERFACE,
+                         1, 0, control_desc.bInterfaceNumber, 0x1000, control_buffer, &transferred);
+    log_transfer_result("DHCP GET FILTER RESPONSE", rc, transferred);
+    if (R_FAILED(rc) || transferred < sizeof(RndisSetComplete)) goto cleanup;
+    RndisSetComplete filter_response;
+    memcpy(&filter_response, control_buffer, sizeof(filter_response));
+    if (filter_response.message_type != RNDIS_SET_CMPLT || filter_response.status != RNDIS_STATUS_SUCCESS) goto cleanup;
+    filter_enabled = true;
+
+    memset(interfaces, 0, sizeof(interfaces)); count = 0; index = -1;
+    rc = usbHsQueryAllInterfaces(&no_filter, interfaces, sizeof(interfaces), &count);
+    log_result("DHCP query data", rc);
+    if (R_FAILED(rc)) goto cleanup;
+    for (int i = 0; i < count && i < MAX_INTERFACES; i++) {
+        if (is_rndis_data(&interfaces[i])) { index = i; break; }
+    }
+    if (index < 0) goto cleanup;
+    memcpy(&data_desc, &interfaces[index].inf.interface_desc, sizeof(data_desc));
+    data_filter.Flags = UsbHsInterfaceFilterFlags_idVendor | UsbHsInterfaceFilterFlags_idProduct |
+                       UsbHsInterfaceFilterFlags_bInterfaceClass | UsbHsInterfaceFilterFlags_bInterfaceSubClass |
+                       UsbHsInterfaceFilterFlags_bInterfaceProtocol;
+    data_filter.idVendor = device_desc.idVendor; data_filter.idProduct = device_desc.idProduct;
+    data_filter.bInterfaceClass = data_desc.bInterfaceClass;
+    data_filter.bInterfaceSubClass = data_desc.bInterfaceSubClass;
+    data_filter.bInterfaceProtocol = data_desc.bInterfaceProtocol;
+    memset(available, 0, sizeof(available)); available_count = 0;
+    rc = usbHsQueryAvailableInterfaces(&data_filter, available, sizeof(available), &available_count);
+    log_result("DHCP query available data", rc);
+    if (R_FAILED(rc) || available_count <= 0) goto cleanup;
+    rc = usbHsAcquireUsbIf(&data_session, &available[0]);
+    log_result("DHCP acquire data", rc);
+    if (R_FAILED(rc)) goto cleanup;
+    data_active = true;
+    for (int i = 0; i < 15; i++) {
+        struct usb_endpoint_descriptor candidate;
+        memcpy(&candidate, &available[0].inf.input_endpoint_descs[i], sizeof(candidate));
+        if (is_bulk_endpoint(&candidate)) { input_desc = candidate; break; }
+    }
+    for (int i = 0; i < 15; i++) {
+        struct usb_endpoint_descriptor candidate;
+        memcpy(&candidate, &available[0].inf.output_endpoint_descs[i], sizeof(candidate));
+        if (is_bulk_endpoint(&candidate)) { output_desc = candidate; break; }
+    }
+    if (!input_desc.bLength || !output_desc.bLength) goto cleanup;
+    rc = usbHsIfOpenUsbEp(&data_session, &input_endpoint, 1, 0x1000, &input_desc);
+    log_result("DHCP open IN", rc); if (R_FAILED(rc)) goto cleanup; input_open = true;
+    rc = usbHsIfOpenUsbEp(&data_session, &output_endpoint, 1, 0x1000, &output_desc);
+    log_result("DHCP open OUT", rc); if (R_FAILED(rc)) goto cleanup; output_open = true;
+
+    rc = usbHsEpPostBufferAsync(&input_endpoint, rx_buffer, 0x1000, 1, &xfer_id);
+    log_result("DHCP post receive", rc); if (R_FAILED(rc)) goto cleanup;
+    size_t discover_size = build_dhcp_discover(tx_buffer, mac);
+    transferred = 0;
+    rc = usbHsEpPostBuffer(&output_endpoint, tx_buffer, discover_size, &transferred);
+    log_transfer_result("DHCPDISCOVER bulk send", rc, transferred);
+    if (R_FAILED(rc) || transferred != discover_size) goto cleanup;
+    printf("DHCPDISCOVER sent; waiting up to 8 seconds for DHCPOFFER.\n");
+    bool got_offer = false;
+    for (int attempt = 0; attempt < 4; attempt++) {
+        rc = eventWait(usbHsEpGetXferEvent(&input_endpoint), 2000000000ULL);
+        log_result("DHCP receive wait", rc);
+        if (R_FAILED(rc)) continue;
+
+        UsbHsXferReport reports[2];
+        eventClear(usbHsEpGetXferEvent(&input_endpoint));
+        rc = usbHsEpGetXferReport(&input_endpoint, reports, 2, &report_count);
+        log_result("DHCP receive report", rc);
+        if (R_FAILED(rc) || report_count == 0) continue;
+
+        printf("Bulk receive: result=0x%08X bytes=%u\n", reports[0].res, reports[0].transferredSize);
+        if (R_FAILED(reports[0].res)) break;
+        u8 message_type = 0;
+        if (reports[0].transferredSize != 0)
+            message_type = inspect_dhcp_reply(rx_buffer, reports[0].transferredSize, &lease);
+        else
+            printf("Ignoring zero-length bulk completion; reposting receive.\n");
+        if (message_type == 2 && lease.has_server) {
+            got_offer = true;
+            printf("DHCPOFFER retained; requesting the offered lease.\n");
+            break;
+        }
+
+        printf("Reposting receive for the next frame.\n");
+        rc = usbHsEpPostBufferAsync(&input_endpoint, rx_buffer, 0x1000, (u64)(attempt + 2), &xfer_id);
+        log_result("DHCP repost receive", rc);
+        if (R_FAILED(rc)) break;
+        if (attempt == 3) printf("No DHCPOFFER before timeout.\n");
+    }
+    if (!got_offer) goto cleanup;
+
+    rc = usbHsEpPostBufferAsync(&input_endpoint, rx_buffer, 0x1000, 16, &xfer_id);
+    log_result("DHCP post ACK receive", rc); if (R_FAILED(rc)) goto cleanup;
+    size_t request_size = build_dhcp_request(tx_buffer, mac, &lease);
+    transferred = 0;
+    rc = usbHsEpPostBuffer(&output_endpoint, tx_buffer, request_size, &transferred);
+    log_transfer_result("DHCPREQUEST bulk send", rc, transferred);
+    if (R_FAILED(rc) || transferred != request_size) goto cleanup;
+    printf("DHCPREQUEST sent; waiting up to 8 seconds for DHCPACK.\n");
+    bool got_ack = false;
+    for (int attempt = 0; attempt < 4; attempt++) {
+        rc = eventWait(usbHsEpGetXferEvent(&input_endpoint), 2000000000ULL);
+        log_result("DHCP ACK receive wait", rc);
+        if (R_FAILED(rc)) continue;
+
+        UsbHsXferReport reports[2];
+        eventClear(usbHsEpGetXferEvent(&input_endpoint));
+        report_count = 0;
+        rc = usbHsEpGetXferReport(&input_endpoint, reports, 2, &report_count);
+        log_result("DHCP ACK receive report", rc);
+        if (R_FAILED(rc) || report_count == 0) continue;
+
+        printf("ACK bulk receive: result=0x%08X bytes=%u\n", reports[0].res, reports[0].transferredSize);
+        if (R_FAILED(reports[0].res)) break;
+        u8 message_type = 0;
+        if (reports[0].transferredSize != 0)
+            message_type = inspect_dhcp_reply(rx_buffer, reports[0].transferredSize, &lease);
+        else
+            printf("Ignoring zero-length bulk completion; reposting receive.\n");
+        if (message_type == 5) {
+            got_ack = true;
+            print_ipv4("DHCPACK accepted for validation only: ", lease.address);
+            printf("\nNo Switch IP, route, or DNS configuration was applied.\n");
+            break;
+        }
+        if (message_type == 6) {
+            printf("DHCPNAK received; no lease was accepted.\n");
+            break;
+        }
+
+        printf("Reposting receive for the next DHCPACK frame.\n");
+        rc = usbHsEpPostBufferAsync(&input_endpoint, rx_buffer, 0x1000, (u64)(17 + attempt), &xfer_id);
+        log_result("DHCP repost ACK receive", rc);
+        if (R_FAILED(rc)) break;
+        if (attempt == 3) printf("No DHCPACK before timeout.\n");
+    }
+    if (!got_ack) printf("Lease was not accepted by this diagnostic.\n");
+
+cleanup:
+    if (output_open) usbHsEpClose(&output_endpoint);
+    if (input_open) usbHsEpClose(&input_endpoint);
+    if (data_active) usbHsIfClose(&data_session);
+    if (control_active && control_buffer) {
+        if (filter_enabled) {
+            set_filter.request_id = 13; set_filter.packet_filter = 0;
+            memcpy(control_buffer, &set_filter, sizeof(set_filter)); transferred = 0;
+            rc = usbHsIfCtrlXfer(&control_session, USB_ENDPOINT_OUT | USB_REQUEST_TYPE_CLASS | USB_RECIPIENT_INTERFACE,
+                                 0, 0, control_desc.bInterfaceNumber, sizeof(set_filter), control_buffer, &transferred);
+            log_transfer_result("DHCP CLEAR FILTER", rc, transferred);
+            if (R_SUCCEEDED(rc) && transferred == sizeof(set_filter)) {
+                memset(control_buffer, 0, 0x1000); transferred = 0;
+                rc = usbHsIfCtrlXfer(&control_session, USB_ENDPOINT_IN | USB_REQUEST_TYPE_CLASS | USB_RECIPIENT_INTERFACE,
+                                     1, 0, control_desc.bInterfaceNumber, 0x1000, control_buffer, &transferred);
+                log_transfer_result("DHCP GET CLEAR RESPONSE", rc, transferred);
+            }
+        }
+        memcpy(control_buffer, &halt, sizeof(halt)); transferred = 0;
+        rc = usbHsIfCtrlXfer(&control_session, USB_ENDPOINT_OUT | USB_REQUEST_TYPE_CLASS | USB_RECIPIENT_INTERFACE,
+                             0, 0, control_desc.bInterfaceNumber, sizeof(halt), control_buffer, &transferred);
+        log_transfer_result("DHCP RNDIS HALT", rc, transferred);
+    }
+    free(tx_buffer); free(rx_buffer); free(control_buffer);
+    if (control_active) usbHsIfClose(&control_session);
     print_recent_results();
 }
 
@@ -400,6 +1137,24 @@ int main(int argc, char *argv[]) {
                 probe_rndis();
             else {
                 printf("usb:hs is unavailable; no RNDIS probe was attempted.\n");
+                print_recent_results();
+            }
+        }
+        if (pressed & HidNpadButton_Y) {
+            draw_header();
+            if (R_SUCCEEDED(usb_rc))
+                probe_rndis_bulk_endpoints();
+            else {
+                printf("usb:hs is unavailable; no bulk endpoint probe was attempted.\n");
+                print_recent_results();
+            }
+        }
+        if (pressed & HidNpadButton_R) {
+            draw_header();
+            if (R_SUCCEEDED(usb_rc))
+                probe_dhcp_discover();
+            else {
+                printf("usb:hs is unavailable; no DHCP probe was attempted.\n");
                 print_recent_results();
             }
         }

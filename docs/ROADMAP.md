@@ -11,8 +11,18 @@
 - [x] Phase 3 (implementation): add the user-triggered, reversible RNDIS initialize/response/HALT control probe.
 - [x] Phase 3 (physical validation): RNDIS initialization completed successfully on the S23 and HALT was accepted.
 - [x] Phase 3 (implementation): add a read-only RNDIS `CURRENT_ADDRESS` query after successful initialization.
-- [ ] Phase 3 (physical validation): run the 0.3.0 MAC-query probe and capture its response.
-- [ ] Phases 4-6: packet transport, IP configuration, and real connectivity tests.
+- [x] Phase 3 (physical validation): the S23 returned adapter MAC `BA:99:FF:7F:BD:23` after the `CURRENT_ADDRESS` query.
+- [x] Phase 4 (implementation): add a no-traffic probe that acquires and opens/closes RNDIS bulk endpoints.
+- [x] Phase 4 (physical validation): the S23 RNDIS data interface and both bulk endpoints opened successfully.
+- [x] Phase 4 (implementation): add a reversible RNDIS packet-filter enable/clear control probe.
+- [x] Phase 4 (physical validation): packet-filter enable and clear completed successfully on the S23.
+- [x] Phase 4 (implementation): add a bounded RNDIS bulk-transfer DHCPDISCOVER probe.
+- [x] Phase 4 (physical validation): inbound bulk data begins with an RNDIS packet header, proving a non-empty data-plane receive.
+- [x] Phase 4 (physical validation): identified the first inbound Ethernet frame as IPv6, proving end-to-end RNDIS frame delivery.
+- [x] Phase 4 (physical validation): received a valid DHCPv4 DHCPOFFER after unrelated IPv6 frames.
+- [x] Phase 5 (implementation): add DHCPREQUEST/DHCPACK validation without yet applying the lease to a Switch network stack.
+- [ ] Phase 5 (physical validation): receive DHCPACK for the selected S23 offer; do not configure the lease on Horizon.
+- [ ] Phase 5-6: apply an accepted lease to a homebrew IP stack, then test DNS and external connectivity.
 - [ ] Phase 7: only after successful homebrew networking, investigate a constrained Atmosphere sysmodule prototype.
 
 ## Acceptance criteria for the current artifact
