@@ -27,8 +27,10 @@
 - [x] Phase 7 (implementation): send one validated ICMP echo request to the resolved DHCP router.
 - [x] Phase 7 (physical validation): receive the matching ICMP echo reply from the DHCP router.
 - [x] Phase 8 (implementation): send and parse one UDP/DNS A query for `example.com` using the DHCP DNS server.
-- [ ] Phase 8 (physical validation): receive and parse the matching DNS response.
-- [ ] Phase 9: introduce retained DHCP parameters to a homebrew-only IPv4 stack, then test a bounded external transport.
+- [x] Phase 8 (physical validation): receive and parse the matching DNS response.
+- [x] Phase 9 (implementation): send one TCP SYN to the first DNS A record, validate SYN-ACK, then send RST cleanup without application data.
+- [ ] Phase 9 (physical validation): receive the matching external TCP SYN-ACK.
+- [ ] Phase 10: separately validate one bounded HTTP request/response.
 - [ ] Phase 7: only after successful homebrew networking, investigate a constrained Atmosphere sysmodule prototype.
 
 ## Acceptance criteria for the current artifact

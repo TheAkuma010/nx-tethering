@@ -39,6 +39,10 @@ The subsequent 0.8.1 physical test completed the full guarded path: it obtained 
 
 The physical 0.9.0 run received the requested ICMP echo reply from the DHCP router, demonstrating a working local IPv4 packet exchange after DHCP and ARP. Version 0.10.0 then sends one UDP DNS A query for `example.com` to the DNS server supplied in the DHCPACK (normally the tether gateway), parses only a matching DNS response, and prints any A records. It still emits no HTTP request and does not configure Horizon.
 
+The physical 0.10.0 run received and parsed the DNS response, returning `172.66.144.243` and `104.20.34.239` for `example.com`. This demonstrates that the DHCP-provided DNS path can resolve a public name through the Android tether. It does not yet prove a TCP handshake, HTTP exchange, or a usable network interface for Horizon.
+
+Version 0.11.0 takes the first A record from that validated DNS response and sends exactly one TCP SYN to port 80. It accepts only a SYN-ACK with the expected IPv4 endpoints, ports, acknowledgement number, and SYN/ACK flags; it immediately sends RST+ACK to release the half-open test connection. No HTTP payload is transmitted in this phase.
+
 ## Alternatives considered
 
 | Candidate | What must be seen in Phase 2 | Decision status |

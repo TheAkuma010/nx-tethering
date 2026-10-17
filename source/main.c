@@ -94,6 +94,11 @@ typedef struct {
     bool has_dns;
 } DhcpLease;
 
+typedef struct {
+    u8 address[4];
+    bool has_address;
+} DnsResult;
+
 static char g_log[LOG_LINES][LOG_LINE_SIZE];
 static unsigned int g_log_head;
 
@@ -104,7 +109,7 @@ static void log_result(const char *label, Result rc) {
 
 static void draw_header(void) {
     consoleClear();
-    printf("NX Tethering Diagnostics 0.10.0 (DHCP DNS probe)\n");
+    printf("NX Tethering Diagnostics 0.11.0 (external TCP handshake)\n");
     printf("NRO startup check passed. This app stays open until PLUS.\n");
     printf("A: scan | X: control | Y: endpoints | R: DHCP handshake | B: redraw | PLUS: exit\n");
     printf("USB detection is not proof of network connectivity.\n\n");
@@ -194,6 +199,10 @@ static u16 get_be16(const u8 *in) {
     return ((u16)in[0] << 8) | in[1];
 }
 
+static u32 get_be32(const u8 *in) {
+    return ((u32)in[0] << 24) | ((u32)in[1] << 16) | ((u32)in[2] << 8) | in[3];
+}
+
 static u32 get_le32(const u8 *in) {
     return (u32)in[0] | ((u32)in[1] << 8) | ((u32)in[2] << 16) | ((u32)in[3] << 24);
 }
@@ -202,6 +211,15 @@ static u16 ipv4_checksum(const u8 *header, size_t length) {
     u32 sum = 0;
     for (size_t i = 0; i < length; i += 2)
         sum += ((u16)header[i] << 8) | header[i + 1];
+    while (sum >> 16) sum = (sum & 0xffffU) + (sum >> 16);
+    return (u16)~sum;
+}
+
+static u16 tcp_checksum(const u8 source[4], const u8 destination[4], const u8 *segment, size_t length) {
+    u32 sum = get_be16(source) + get_be16(source + 2) + get_be16(destination) + get_be16(destination + 2);
+    sum += 6 + length;
+    for (size_t i = 0; i + 1 < length; i += 2) sum += ((u16)segment[i] << 8) | segment[i + 1];
+    if (length & 1) sum += (u16)segment[length - 1] << 8;
     while (sum >> 16) sum = (sum & 0xffffU) + (sum >> 16);
     return (u16)~sum;
 }
@@ -419,6 +437,46 @@ static size_t build_dns_query(u8 *out, const u8 mac[6], const DhcpLease *lease,
     return RNDIS_PACKET_HEADER_SIZE + frame_size;
 }
 
+static size_t build_tcp_segment(u8 *out, const u8 mac[6], const DhcpLease *lease,
+                                const u8 gateway_mac[6], const u8 destination[4],
+                                u32 sequence, u32 acknowledgement, u8 flags) {
+    const size_t ethernet_size = 14;
+    const size_t ipv4_size = 20;
+    const size_t tcp_size = 20;
+    const size_t frame_size = ethernet_size + ipv4_size + tcp_size;
+    u8 *ethernet = out + RNDIS_PACKET_HEADER_SIZE;
+    u8 *ipv4 = ethernet + ethernet_size;
+    u8 *tcp = ipv4 + ipv4_size;
+
+    memset(out, 0, 0x1000);
+    put_le32(out + 0, RNDIS_PACKET_MSG);
+    put_le32(out + 4, RNDIS_PACKET_HEADER_SIZE + frame_size);
+    put_le32(out + 8, RNDIS_PACKET_HEADER_SIZE - 8);
+    put_le32(out + 12, frame_size);
+    memcpy(ethernet, gateway_mac, 6);
+    memcpy(ethernet + 6, mac, 6);
+    put_be16(ethernet + 12, 0x0800);
+
+    ipv4[0] = 0x45;
+    put_be16(ipv4 + 2, ipv4_size + tcp_size);
+    put_be16(ipv4 + 4, 0x4e5a);
+    ipv4[8] = 64;
+    ipv4[9] = 6;
+    memcpy(ipv4 + 12, lease->address, 4);
+    memcpy(ipv4 + 16, destination, 4);
+    put_be16(ipv4 + 10, ipv4_checksum(ipv4, ipv4_size));
+
+    put_be16(tcp, 49152);
+    put_be16(tcp + 2, 80);
+    put_be32(tcp + 4, sequence);
+    put_be32(tcp + 8, acknowledgement);
+    tcp[12] = 0x50;
+    tcp[13] = flags;
+    put_be16(tcp + 14, 0xffff);
+    put_be16(tcp + 16, tcp_checksum(lease->address, destination, tcp, tcp_size));
+    return RNDIS_PACKET_HEADER_SIZE + frame_size;
+}
+
 static void print_ipv4(const char *label, const u8 *address) {
     printf("%s%u.%u.%u.%u", label, address[0], address[1], address[2], address[3]);
 }
@@ -589,7 +647,7 @@ static const u8 *dns_skip_name(const u8 *cursor, const u8 *end) {
     return NULL;
 }
 
-static bool inspect_dns_reply(const u8 *packet, u32 packet_size, const DhcpLease *lease) {
+static bool inspect_dns_reply(const u8 *packet, u32 packet_size, const DhcpLease *lease, DnsResult *result) {
     if (packet_size < RNDIS_PACKET_HEADER_SIZE) return false;
     u32 data_offset = 8 + get_le32(packet + 8);
     u32 data_length = get_le32(packet + 12);
@@ -627,9 +685,34 @@ static bool inspect_dns_reply(const u8 *packet, u32 packet_size, const DhcpLease
         if (type == 1 && dns_class == 1 && data_length_field == 4) {
             print_ipv4("DNS A: ", cursor);
             printf("\n");
+            if (!result->has_address) {
+                memcpy(result->address, cursor, sizeof(result->address));
+                result->has_address = true;
+            }
         }
         cursor += data_length_field;
     }
+    return true;
+}
+
+static bool inspect_tcp_syn_ack(const u8 *packet, u32 packet_size, const DhcpLease *lease,
+                                const u8 destination[4], u32 expected_ack, u32 *server_sequence) {
+    if (packet_size < RNDIS_PACKET_HEADER_SIZE) return false;
+    u32 data_offset = 8 + get_le32(packet + 8);
+    u32 data_length = get_le32(packet + 12);
+    if (get_le32(packet) != RNDIS_PACKET_MSG || data_offset > packet_size ||
+        data_length > packet_size - data_offset || data_length < 14 + 20 + 20) return false;
+    const u8 *ethernet = packet + data_offset;
+    if (get_be16(ethernet + 12) != 0x0800) return false;
+    const u8 *ipv4 = ethernet + 14;
+    u8 ihl = (ipv4[0] & 0x0f) * 4;
+    if (ihl < 20 || data_length < (u32)(14 + ihl + 20) || ipv4[9] != 6 ||
+        memcmp(ipv4 + 12, destination, 4) != 0 || memcmp(ipv4 + 16, lease->address, 4) != 0) return false;
+    const u8 *tcp = ipv4 + ihl;
+    if (get_be16(tcp) != 80 || get_be16(tcp + 2) != 49152 || (tcp[13] & 0x12) != 0x12 ||
+        get_be32(tcp + 8) != expected_ack) return false;
+    *server_sequence = get_be32(tcp + 4);
+    printf("TCP SYN-ACK received from resolved example.com address.\n");
     return true;
 }
 
@@ -1373,6 +1456,7 @@ static void probe_dhcp_discover(void) {
     print_ipv4("DNS query example.com sent to ", lease.dns);
     printf("; waiting up to 4 seconds for reply.\n");
     bool got_dns = false;
+    DnsResult resolved = {0};
     for (int attempt = 0; attempt < 2; attempt++) {
         rc = eventWait(usbHsEpGetXferEvent(&input_endpoint), 2000000000ULL);
         log_result("DNS receive wait", rc);
@@ -1386,7 +1470,7 @@ static void probe_dhcp_discover(void) {
         if (R_FAILED(rc) || report_count == 0) continue;
         printf("DNS bulk receive: result=0x%08X bytes=%u\n", reports[0].res, reports[0].transferredSize);
         if (R_FAILED(reports[0].res)) break;
-        if (inspect_dns_reply(rx_buffer, reports[0].transferredSize, &lease)) {
+        if (inspect_dns_reply(rx_buffer, reports[0].transferredSize, &lease, &resolved)) {
             got_dns = true;
             break;
         }
@@ -1396,6 +1480,57 @@ static void probe_dhcp_discover(void) {
         if (R_FAILED(rc)) break;
     }
     if (!got_dns) printf("No matching DNS response before timeout.\n");
+    if (!got_dns || !resolved.has_address) {
+        if (got_dns) printf("DNS response had no A record; TCP probe skipped.\n");
+        goto cleanup;
+    }
+
+    const u32 client_sequence = 0x4e545031U;
+    rc = usbHsEpPostBufferAsync(&input_endpoint, rx_buffer, 0x1000, 80, &xfer_id);
+    log_result("TCP post SYN receive", rc); if (R_FAILED(rc)) goto cleanup;
+    size_t syn_size = build_tcp_segment(tx_buffer, mac, &lease, gateway_mac, resolved.address,
+                                        client_sequence, 0, 0x02);
+    transferred = 0;
+    rc = usbHsEpPostBuffer(&output_endpoint, tx_buffer, syn_size, &transferred);
+    log_transfer_result("TCP SYN example.com:80", rc, transferred);
+    if (R_FAILED(rc) || transferred != syn_size) goto cleanup;
+    print_ipv4("TCP SYN sent to resolved address ", resolved.address);
+    printf(" port 80; waiting up to 4 seconds for SYN-ACK.\n");
+    bool got_syn_ack = false;
+    u32 server_sequence = 0;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        rc = eventWait(usbHsEpGetXferEvent(&input_endpoint), 2000000000ULL);
+        log_result("TCP SYN receive wait", rc);
+        if (R_FAILED(rc)) continue;
+        UsbHsXferReport reports[2];
+        eventClear(usbHsEpGetXferEvent(&input_endpoint));
+        report_count = 0;
+        rc = usbHsEpGetXferReport(&input_endpoint, reports, 2, &report_count);
+        log_result("TCP SYN receive report", rc);
+        if (R_FAILED(rc) || report_count == 0) continue;
+        printf("TCP bulk receive: result=0x%08X bytes=%u\n", reports[0].res, reports[0].transferredSize);
+        if (R_FAILED(reports[0].res)) break;
+        if (inspect_tcp_syn_ack(rx_buffer, reports[0].transferredSize, &lease, resolved.address,
+                                client_sequence + 1, &server_sequence)) {
+            got_syn_ack = true;
+            break;
+        }
+        printf("Frame was not the requested TCP SYN-ACK; reposting receive.\n");
+        rc = usbHsEpPostBufferAsync(&input_endpoint, rx_buffer, 0x1000, (u64)(81 + attempt), &xfer_id);
+        log_result("TCP repost SYN receive", rc);
+        if (R_FAILED(rc)) break;
+    }
+    if (!got_syn_ack) {
+        printf("No matching TCP SYN-ACK before timeout.\n");
+        goto cleanup;
+    }
+    size_t rst_size = build_tcp_segment(tx_buffer, mac, &lease, gateway_mac, resolved.address,
+                                        client_sequence + 1, server_sequence + 1, 0x14);
+    transferred = 0;
+    rc = usbHsEpPostBuffer(&output_endpoint, tx_buffer, rst_size, &transferred);
+    log_transfer_result("TCP RST cleanup", rc, transferred);
+    if (R_SUCCEEDED(rc) && transferred == rst_size)
+        printf("TCP handshake validated; sent RST cleanup without HTTP data.\n");
 
 cleanup:
     if (output_open) usbHsEpClose(&output_endpoint);
