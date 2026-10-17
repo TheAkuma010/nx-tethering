@@ -31,7 +31,7 @@
 - [x] Phase 9 (implementation): send one TCP SYN to the first DNS A record, validate SYN-ACK, then send RST cleanup without application data.
 - [x] Phase 9 (physical validation): receive the matching external TCP SYN-ACK.
 - [x] Phase 10 (implementation): send one HTTP `GET /` after the validated handshake and parse its status line.
-- [ ] Phase 10 (physical validation): receive and parse a matching HTTP response.
+- [x] Phase 10 (physical validation): receive and parse a matching HTTP response.
 - [ ] Phase 11: assess whether to adopt an embedded network stack rather than extend bespoke protocol probes.
 - [ ] Phase 7: only after successful homebrew networking, investigate a constrained Atmosphere sysmodule prototype.
 

@@ -45,6 +45,8 @@ Version 0.11.0 takes the first A record from that validated DNS response and sen
 
 The physical 0.11.0 run received the matching SYN-ACK from the resolved `example.com` address and sent RST cleanup successfully. Version 0.12.0 completes a short-lived connection instead: it sends one `GET /` with `Host: example.com` and `Connection: close`, accepts a response only when the TCP acknowledgement and sequence numbers match, prints only the HTTP status line, and sends RST cleanup afterward. This is an intentionally bounded application-layer probe, not a general HTTP client or Horizon network service.
 
+The physical 0.12.0 run received an initial TCP acknowledgement without payload, reposted the receive correctly, and then parsed `HTTP/1.1 200 OK`. Together with the successful cleanup RST, this is end-to-end evidence that a homebrew process can reach an external HTTP service through the S23 tether. It does **not** create a Horizon network interface or make games/system applications use this transport.
+
 ## Alternatives considered
 
 | Candidate | What must be seen in Phase 2 | Decision status |
