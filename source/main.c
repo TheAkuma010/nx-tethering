@@ -84,7 +84,14 @@ typedef struct {
 typedef struct {
     u8 address[4];
     u8 server[4];
+    u8 subnet_mask[4];
+    u8 router[4];
+    u8 dns[4];
+    u32 lease_seconds;
     bool has_server;
+    bool has_subnet_mask;
+    bool has_router;
+    bool has_dns;
 } DhcpLease;
 
 static char g_log[LOG_LINES][LOG_LINE_SIZE];
@@ -97,7 +104,7 @@ static void log_result(const char *label, Result rc) {
 
 static void draw_header(void) {
     consoleClear();
-    printf("NX Tethering Diagnostics 0.7.0 (DHCP request/ack validation)\n");
+    printf("NX Tethering Diagnostics 0.8.0 (DHCP options + ARP probe)\n");
     printf("NRO startup check passed. This app stays open until PLUS.\n");
     printf("A: scan | X: control | Y: endpoints | R: DHCP handshake | B: redraw | PLUS: exit\n");
     printf("USB detection is not proof of network connectivity.\n\n");
@@ -306,6 +313,34 @@ static size_t build_dhcp_request(u8 *out, const u8 mac[6], const DhcpLease *leas
     return RNDIS_PACKET_HEADER_SIZE + frame_size;
 }
 
+static size_t build_arp_request(u8 *out, const u8 mac[6], const DhcpLease *lease) {
+    const size_t ethernet_size = 14;
+    const size_t arp_size = 28;
+    const size_t frame_size = ethernet_size + arp_size;
+    u8 *ethernet = out + RNDIS_PACKET_HEADER_SIZE;
+    u8 *arp = ethernet + ethernet_size;
+
+    memset(out, 0, 0x1000);
+    put_le32(out + 0, RNDIS_PACKET_MSG);
+    put_le32(out + 4, RNDIS_PACKET_HEADER_SIZE + frame_size);
+    put_le32(out + 8, RNDIS_PACKET_HEADER_SIZE - 8);
+    put_le32(out + 12, frame_size);
+
+    memset(ethernet, 0xff, 6);
+    memcpy(ethernet + 6, mac, 6);
+    put_be16(ethernet + 12, 0x0806);
+    put_be16(arp + 0, 1);       /* Ethernet */
+    put_be16(arp + 2, 0x0800);  /* IPv4 */
+    arp[4] = 6;
+    arp[5] = 4;
+    put_be16(arp + 6, 1);       /* request */
+    memcpy(arp + 8, mac, 6);
+    memcpy(arp + 14, lease->address, 4);
+    memset(arp + 18, 0, 6);
+    memcpy(arp + 24, lease->router, 4);
+    return RNDIS_PACKET_HEADER_SIZE + frame_size;
+}
+
 static void print_ipv4(const char *label, const u8 *address) {
     printf("%s%u.%u.%u.%u", label, address[0], address[1], address[2], address[3]);
 }
@@ -376,6 +411,10 @@ static u8 inspect_dhcp_reply(const u8 *packet, u32 packet_size, DhcpLease *lease
     }
     memcpy(lease->address, dhcp + 16, sizeof(lease->address));
     lease->has_server = false;
+    lease->has_subnet_mask = false;
+    lease->has_router = false;
+    lease->has_dns = false;
+    lease->lease_seconds = 0;
     print_ipv4("DHCP address: ", lease->address);
     printf("\n");
     const u8 *option = dhcp + 240;
@@ -397,9 +436,50 @@ static u8 inspect_dhcp_reply(const u8 *packet, u32 packet_size, DhcpLease *lease
             print_ipv4("DHCP server: ", lease->server);
             printf("\n");
         }
+        else if (code == 1 && length == 4) {
+            memcpy(lease->subnet_mask, option, sizeof(lease->subnet_mask));
+            lease->has_subnet_mask = true;
+            print_ipv4("DHCP subnet mask: ", lease->subnet_mask);
+            printf("\n");
+        }
+        else if (code == 3 && length >= 4) {
+            memcpy(lease->router, option, sizeof(lease->router));
+            lease->has_router = true;
+            print_ipv4("DHCP router: ", lease->router);
+            printf("\n");
+        }
+        else if (code == 6 && length >= 4) {
+            memcpy(lease->dns, option, sizeof(lease->dns));
+            lease->has_dns = true;
+            print_ipv4("DHCP DNS: ", lease->dns);
+            printf("\n");
+        }
+        else if (code == 51 && length == 4) {
+            lease->lease_seconds = ((u32)option[0] << 24) | ((u32)option[1] << 16) |
+                                  ((u32)option[2] << 8) | option[3];
+            printf("DHCP lease time: %u seconds\n", lease->lease_seconds);
+        }
         option += length;
     }
     return message_type;
+}
+
+static bool inspect_arp_reply(const u8 *packet, u32 packet_size, const DhcpLease *lease, u8 gateway_mac[6]) {
+    if (packet_size < RNDIS_PACKET_HEADER_SIZE) return false;
+    u32 data_offset = 8 + get_le32(packet + 8);
+    u32 data_length = get_le32(packet + 12);
+    if (get_le32(packet) != RNDIS_PACKET_MSG || data_offset > packet_size ||
+        data_length > packet_size - data_offset || data_length < 14 + 28) return false;
+    const u8 *ethernet = packet + data_offset;
+    if (get_be16(ethernet + 12) != 0x0806) return false;
+    const u8 *arp = ethernet + 14;
+    if (get_be16(arp) != 1 || get_be16(arp + 2) != 0x0800 || arp[4] != 6 || arp[5] != 4 ||
+        get_be16(arp + 6) != 2 || memcmp(arp + 14, lease->router, 4) != 0 ||
+        memcmp(arp + 24, lease->address, 4) != 0) return false;
+    memcpy(gateway_mac, arp + 8, 6);
+    printf("ARP reply: gateway MAC %02X:%02X:%02X:%02X:%02X:%02X\n",
+           gateway_mac[0], gateway_mac[1], gateway_mac[2], gateway_mac[3], gateway_mac[4], gateway_mac[5]);
+    return true;
 }
 
 static void probe_rndis(void) {
@@ -1046,6 +1126,45 @@ static void probe_dhcp_discover(void) {
         if (attempt == 3) printf("No DHCPACK before timeout.\n");
     }
     if (!got_ack) printf("Lease was not accepted by this diagnostic.\n");
+    if (!got_ack || !lease.has_router) {
+        if (got_ack) printf("DHCPACK did not contain a router option; ARP probe skipped.\n");
+        goto cleanup;
+    }
+
+    u8 gateway_mac[6] = {0};
+    rc = usbHsEpPostBufferAsync(&input_endpoint, rx_buffer, 0x1000, 32, &xfer_id);
+    log_result("ARP post receive", rc); if (R_FAILED(rc)) goto cleanup;
+    size_t arp_size = build_arp_request(tx_buffer, mac, &lease);
+    transferred = 0;
+    rc = usbHsEpPostBuffer(&output_endpoint, tx_buffer, arp_size, &transferred);
+    log_transfer_result("ARP gateway request", rc, transferred);
+    if (R_FAILED(rc) || transferred != arp_size) goto cleanup;
+    print_ipv4("ARP request sent for DHCP router ", lease.router);
+    printf("; waiting up to 4 seconds for its MAC.\n");
+    bool got_arp = false;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        rc = eventWait(usbHsEpGetXferEvent(&input_endpoint), 2000000000ULL);
+        log_result("ARP receive wait", rc);
+        if (R_FAILED(rc)) continue;
+
+        UsbHsXferReport reports[2];
+        eventClear(usbHsEpGetXferEvent(&input_endpoint));
+        report_count = 0;
+        rc = usbHsEpGetXferReport(&input_endpoint, reports, 2, &report_count);
+        log_result("ARP receive report", rc);
+        if (R_FAILED(rc) || report_count == 0) continue;
+        printf("ARP bulk receive: result=0x%08X bytes=%u\n", reports[0].res, reports[0].transferredSize);
+        if (R_FAILED(reports[0].res)) break;
+        if (inspect_arp_reply(rx_buffer, reports[0].transferredSize, &lease, gateway_mac)) {
+            got_arp = true;
+            break;
+        }
+        printf("Frame was not the requested ARP reply; reposting receive.\n");
+        rc = usbHsEpPostBufferAsync(&input_endpoint, rx_buffer, 0x1000, (u64)(33 + attempt), &xfer_id);
+        log_result("ARP repost receive", rc);
+        if (R_FAILED(rc)) break;
+    }
+    if (!got_arp) printf("No matching gateway ARP reply before timeout.\n");
 
 cleanup:
     if (output_open) usbHsEpClose(&output_endpoint);

@@ -21,7 +21,10 @@
 - [x] Phase 4 (physical validation): identified the first inbound Ethernet frame as IPv6, proving end-to-end RNDIS frame delivery.
 - [x] Phase 4 (physical validation): received a valid DHCPv4 DHCPOFFER after unrelated IPv6 frames.
 - [x] Phase 5 (implementation): add DHCPREQUEST/DHCPACK validation without yet applying the lease to a Switch network stack.
-- [ ] Phase 5 (physical validation): receive DHCPACK for the selected S23 offer; do not configure the lease on Horizon.
+- [x] Phase 5 (physical validation): receive DHCPACK for the selected S23 offer; do not configure the lease on Horizon.
+- [x] Phase 6 (implementation): parse DHCPACK mask/router/DNS/lease parameters and send a bounded ARP probe for the DHCP router.
+- [ ] Phase 6 (physical validation): receive the matching ARP reply for the DHCP router.
+- [ ] Phase 6-7: introduce retained DHCP parameters to a homebrew-only IPv4 stack, then test ICMP, DNS, and external connectivity.
 - [ ] Phase 5-6: apply an accepted lease to a homebrew IP stack, then test DNS and external connectivity.
 - [ ] Phase 7: only after successful homebrew networking, investigate a constrained Atmosphere sysmodule prototype.
 

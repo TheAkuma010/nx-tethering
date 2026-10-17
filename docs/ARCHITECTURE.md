@@ -29,6 +29,10 @@ The third physical 0.6.5 run received a valid DHCPv4 DHCPOFFER: offered address 
 
 Version 0.7.0 keeps this boundary while validating the next DHCP transition. After retaining a type-2 offer containing a server identifier, it sends a DHCPREQUEST with that address and server identifier, then accepts only a type-5 DHCPACK as diagnostic evidence. It does not apply the resulting address, subnet, route, DNS, or lease timers anywhere on the Switch.
 
+The physical S23 run of version 0.7.0 completed that exchange: it logged `DHCPREQUEST bulk send`, then received DHCP message type 5 and printed `DHCPACK accepted for validation only: 10.248.48.45`. The app subsequently cleared the packet filter and halted RNDIS successfully. This is end-to-end evidence for RNDIS plus DHCP DISCOVER/OFFER/REQUEST/ACK; it remains separate from configuring a homebrew IP stack or Horizon networking.
+
+Version 0.8.0 parses the DHCPACK options needed for a later homebrew IPv4 stack (subnet mask, router, DNS, and lease time). If a router option is present, it sends exactly one ARP request for that router and accepts only a reply whose sender protocol address is the router and whose target protocol address is the DHCPACK address. No IP address is installed and no IP packet is sent in this phase.
+
 ## Alternatives considered
 
 | Candidate | What must be seen in Phase 2 | Decision status |
