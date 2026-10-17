@@ -43,6 +43,8 @@ The physical 0.10.0 run received and parsed the DNS response, returning `172.66.
 
 Version 0.11.0 takes the first A record from that validated DNS response and sends exactly one TCP SYN to port 80. It accepts only a SYN-ACK with the expected IPv4 endpoints, ports, acknowledgement number, and SYN/ACK flags; it immediately sends RST+ACK to release the half-open test connection. No HTTP payload is transmitted in this phase.
 
+The physical 0.11.0 run received the matching SYN-ACK from the resolved `example.com` address and sent RST cleanup successfully. Version 0.12.0 completes a short-lived connection instead: it sends one `GET /` with `Host: example.com` and `Connection: close`, accepts a response only when the TCP acknowledgement and sequence numbers match, prints only the HTTP status line, and sends RST cleanup afterward. This is an intentionally bounded application-layer probe, not a general HTTP client or Horizon network service.
+
 ## Alternatives considered
 
 | Candidate | What must be seen in Phase 2 | Decision status |

@@ -109,7 +109,7 @@ static void log_result(const char *label, Result rc) {
 
 static void draw_header(void) {
     consoleClear();
-    printf("NX Tethering Diagnostics 0.11.0 (external TCP handshake)\n");
+    printf("NX Tethering Diagnostics 0.12.0 (HTTP response probe)\n");
     printf("NRO startup check passed. This app stays open until PLUS.\n");
     printf("A: scan | X: control | Y: endpoints | R: DHCP handshake | B: redraw | PLUS: exit\n");
     printf("USB detection is not proof of network connectivity.\n\n");
@@ -439,10 +439,11 @@ static size_t build_dns_query(u8 *out, const u8 mac[6], const DhcpLease *lease,
 
 static size_t build_tcp_segment(u8 *out, const u8 mac[6], const DhcpLease *lease,
                                 const u8 gateway_mac[6], const u8 destination[4],
-                                u32 sequence, u32 acknowledgement, u8 flags) {
+                                u32 sequence, u32 acknowledgement, u8 flags,
+                                const void *payload, size_t payload_size) {
     const size_t ethernet_size = 14;
     const size_t ipv4_size = 20;
-    const size_t tcp_size = 20;
+    const size_t tcp_size = 20 + payload_size;
     const size_t frame_size = ethernet_size + ipv4_size + tcp_size;
     u8 *ethernet = out + RNDIS_PACKET_HEADER_SIZE;
     u8 *ipv4 = ethernet + ethernet_size;
@@ -473,6 +474,7 @@ static size_t build_tcp_segment(u8 *out, const u8 mac[6], const DhcpLease *lease
     tcp[12] = 0x50;
     tcp[13] = flags;
     put_be16(tcp + 14, 0xffff);
+    if (payload_size) memcpy(tcp + 20, payload, payload_size);
     put_be16(tcp + 16, tcp_checksum(lease->address, destination, tcp, tcp_size));
     return RNDIS_PACKET_HEADER_SIZE + frame_size;
 }
@@ -713,6 +715,36 @@ static bool inspect_tcp_syn_ack(const u8 *packet, u32 packet_size, const DhcpLea
         get_be32(tcp + 8) != expected_ack) return false;
     *server_sequence = get_be32(tcp + 4);
     printf("TCP SYN-ACK received from resolved example.com address.\n");
+    return true;
+}
+
+static bool inspect_http_response(const u8 *packet, u32 packet_size, const DhcpLease *lease,
+                                  const u8 destination[4], u32 expected_ack, u32 expected_sequence,
+                                  u32 *received_payload_size) {
+    if (packet_size < RNDIS_PACKET_HEADER_SIZE) return false;
+    u32 data_offset = 8 + get_le32(packet + 8);
+    u32 data_length = get_le32(packet + 12);
+    if (get_le32(packet) != RNDIS_PACKET_MSG || data_offset > packet_size ||
+        data_length > packet_size - data_offset || data_length < 14 + 20 + 20) return false;
+    const u8 *ethernet = packet + data_offset;
+    if (get_be16(ethernet + 12) != 0x0800) return false;
+    const u8 *ipv4 = ethernet + 14;
+    u8 ihl = (ipv4[0] & 0x0f) * 4;
+    if (ihl < 20 || data_length < (u32)(14 + ihl + 20) || ipv4[9] != 6 ||
+        memcmp(ipv4 + 12, destination, 4) != 0 || memcmp(ipv4 + 16, lease->address, 4) != 0) return false;
+    const u8 *tcp = ipv4 + ihl;
+    u8 tcp_header_size = (tcp[12] >> 4) * 4;
+    if (tcp_header_size < 20 || data_length < (u32)(14 + ihl + tcp_header_size) ||
+        get_be16(tcp) != 80 || get_be16(tcp + 2) != 49152 || get_be32(tcp + 8) != expected_ack ||
+        get_be32(tcp + 4) != expected_sequence) return false;
+    u32 payload_size = data_length - 14 - ihl - tcp_header_size;
+    if (payload_size < 5 || memcmp(tcp + tcp_header_size, "HTTP/", 5) != 0) return false;
+    const u8 *payload = tcp + tcp_header_size;
+    printf("HTTP status: ");
+    for (u32 i = 0; i < payload_size && i < 64 && payload[i] != '\r' && payload[i] != '\n'; i++)
+        putchar(payload[i] >= 0x20 && payload[i] <= 0x7e ? payload[i] : '.');
+    printf("\n");
+    *received_payload_size = payload_size;
     return true;
 }
 
@@ -1489,7 +1521,7 @@ static void probe_dhcp_discover(void) {
     rc = usbHsEpPostBufferAsync(&input_endpoint, rx_buffer, 0x1000, 80, &xfer_id);
     log_result("TCP post SYN receive", rc); if (R_FAILED(rc)) goto cleanup;
     size_t syn_size = build_tcp_segment(tx_buffer, mac, &lease, gateway_mac, resolved.address,
-                                        client_sequence, 0, 0x02);
+                                        client_sequence, 0, 0x02, NULL, 0);
     transferred = 0;
     rc = usbHsEpPostBuffer(&output_endpoint, tx_buffer, syn_size, &transferred);
     log_transfer_result("TCP SYN example.com:80", rc, transferred);
@@ -1524,13 +1556,53 @@ static void probe_dhcp_discover(void) {
         printf("No matching TCP SYN-ACK before timeout.\n");
         goto cleanup;
     }
+
+    static const char http_request[] = "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+    const size_t http_request_size = sizeof(http_request) - 1;
+    rc = usbHsEpPostBufferAsync(&input_endpoint, rx_buffer, 0x1000, 96, &xfer_id);
+    log_result("HTTP post receive", rc); if (R_FAILED(rc)) goto cleanup;
+    size_t http_size = build_tcp_segment(tx_buffer, mac, &lease, gateway_mac, resolved.address,
+                                         client_sequence + 1, server_sequence + 1, 0x18,
+                                         http_request, http_request_size);
+    transferred = 0;
+    rc = usbHsEpPostBuffer(&output_endpoint, tx_buffer, http_size, &transferred);
+    log_transfer_result("HTTP GET example.com", rc, transferred);
+    if (R_FAILED(rc) || transferred != http_size) goto cleanup;
+    printf("HTTP GET sent; waiting up to 4 seconds for response.\n");
+    bool got_http = false;
+    u32 http_payload_size = 0;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        rc = eventWait(usbHsEpGetXferEvent(&input_endpoint), 2000000000ULL);
+        log_result("HTTP receive wait", rc);
+        if (R_FAILED(rc)) continue;
+        UsbHsXferReport reports[2];
+        eventClear(usbHsEpGetXferEvent(&input_endpoint));
+        report_count = 0;
+        rc = usbHsEpGetXferReport(&input_endpoint, reports, 2, &report_count);
+        log_result("HTTP receive report", rc);
+        if (R_FAILED(rc) || report_count == 0) continue;
+        printf("HTTP bulk receive: result=0x%08X bytes=%u\n", reports[0].res, reports[0].transferredSize);
+        if (R_FAILED(reports[0].res)) break;
+        if (inspect_http_response(rx_buffer, reports[0].transferredSize, &lease, resolved.address,
+                                  client_sequence + 1 + http_request_size, server_sequence + 1,
+                                  &http_payload_size)) {
+            got_http = true;
+            break;
+        }
+        printf("Frame was not the requested HTTP response; reposting receive.\n");
+        rc = usbHsEpPostBufferAsync(&input_endpoint, rx_buffer, 0x1000, (u64)(97 + attempt), &xfer_id);
+        log_result("HTTP repost receive", rc);
+        if (R_FAILED(rc)) break;
+    }
+    if (!got_http) printf("No matching HTTP response before timeout.\n");
     size_t rst_size = build_tcp_segment(tx_buffer, mac, &lease, gateway_mac, resolved.address,
-                                        client_sequence + 1, server_sequence + 1, 0x14);
+                                        client_sequence + 1 + http_request_size,
+                                        server_sequence + 1 + http_payload_size, 0x14, NULL, 0);
     transferred = 0;
     rc = usbHsEpPostBuffer(&output_endpoint, tx_buffer, rst_size, &transferred);
     log_transfer_result("TCP RST cleanup", rc, transferred);
     if (R_SUCCEEDED(rc) && transferred == rst_size)
-        printf("TCP handshake validated; sent RST cleanup without HTTP data.\n");
+        printf("TCP cleanup RST sent after HTTP probe.\n");
 
 cleanup:
     if (output_open) usbHsEpClose(&output_endpoint);

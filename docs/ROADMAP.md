@@ -29,8 +29,10 @@
 - [x] Phase 8 (implementation): send and parse one UDP/DNS A query for `example.com` using the DHCP DNS server.
 - [x] Phase 8 (physical validation): receive and parse the matching DNS response.
 - [x] Phase 9 (implementation): send one TCP SYN to the first DNS A record, validate SYN-ACK, then send RST cleanup without application data.
-- [ ] Phase 9 (physical validation): receive the matching external TCP SYN-ACK.
-- [ ] Phase 10: separately validate one bounded HTTP request/response.
+- [x] Phase 9 (physical validation): receive the matching external TCP SYN-ACK.
+- [x] Phase 10 (implementation): send one HTTP `GET /` after the validated handshake and parse its status line.
+- [ ] Phase 10 (physical validation): receive and parse a matching HTTP response.
+- [ ] Phase 11: assess whether to adopt an embedded network stack rather than extend bespoke protocol probes.
 - [ ] Phase 7: only after successful homebrew networking, investigate a constrained Atmosphere sysmodule prototype.
 
 ## Acceptance criteria for the current artifact
