@@ -10,7 +10,7 @@ SOURCES     := source
 INCLUDES    := include
 APP_TITLE   := NX Tethering Diagnostics
 APP_AUTHOR  := nx-tethering contributors
-APP_VERSION := 0.8.0
+APP_VERSION := 0.9.0
 ARCH        := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 CFLAGS      := -g -Wall -Wextra -O2 -ffunction-sections -fdata-sections $(ARCH) $(INCLUDE) -D__SWITCH__
 ASFLAGS     := -g $(ARCH)

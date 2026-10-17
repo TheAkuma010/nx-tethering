@@ -104,7 +104,7 @@ static void log_result(const char *label, Result rc) {
 
 static void draw_header(void) {
     consoleClear();
-    printf("NX Tethering Diagnostics 0.8.0 (DHCP options + ARP probe)\n");
+    printf("NX Tethering Diagnostics 0.9.0 (gateway ICMP probe)\n");
     printf("NRO startup check passed. This app stays open until PLUS.\n");
     printf("A: scan | X: control | Y: endpoints | R: DHCP handshake | B: redraw | PLUS: exit\n");
     printf("USB detection is not proof of network connectivity.\n\n");
@@ -341,6 +341,42 @@ static size_t build_arp_request(u8 *out, const u8 mac[6], const DhcpLease *lease
     return RNDIS_PACKET_HEADER_SIZE + frame_size;
 }
 
+static size_t build_icmp_echo_request(u8 *out, const u8 mac[6], const DhcpLease *lease,
+                                      const u8 gateway_mac[6]) {
+    const size_t ethernet_size = 14;
+    const size_t ipv4_size = 20;
+    const size_t icmp_size = 24;
+    const size_t frame_size = ethernet_size + ipv4_size + icmp_size;
+    u8 *ethernet = out + RNDIS_PACKET_HEADER_SIZE;
+    u8 *ipv4 = ethernet + ethernet_size;
+    u8 *icmp = ipv4 + ipv4_size;
+
+    memset(out, 0, 0x1000);
+    put_le32(out + 0, RNDIS_PACKET_MSG);
+    put_le32(out + 4, RNDIS_PACKET_HEADER_SIZE + frame_size);
+    put_le32(out + 8, RNDIS_PACKET_HEADER_SIZE - 8);
+    put_le32(out + 12, frame_size);
+
+    memcpy(ethernet, gateway_mac, 6);
+    memcpy(ethernet + 6, mac, 6);
+    put_be16(ethernet + 12, 0x0800);
+    ipv4[0] = 0x45;
+    put_be16(ipv4 + 2, ipv4_size + icmp_size);
+    put_be16(ipv4 + 4, 0x4e58);
+    ipv4[8] = 64;
+    ipv4[9] = 1; /* ICMP */
+    memcpy(ipv4 + 12, lease->address, 4);
+    memcpy(ipv4 + 16, lease->router, 4);
+    put_be16(ipv4 + 10, ipv4_checksum(ipv4, ipv4_size));
+
+    icmp[0] = 8; /* echo request */
+    put_be16(icmp + 4, 0x4e58);
+    put_be16(icmp + 6, 1);
+    memcpy(icmp + 8, "NX-TETHER-ICMP", 14);
+    put_be16(icmp + 2, ipv4_checksum(icmp, icmp_size));
+    return RNDIS_PACKET_HEADER_SIZE + frame_size;
+}
+
 static void print_ipv4(const char *label, const u8 *address) {
     printf("%s%u.%u.%u.%u", label, address[0], address[1], address[2], address[3]);
 }
@@ -479,6 +515,24 @@ static bool inspect_arp_reply(const u8 *packet, u32 packet_size, const DhcpLease
     memcpy(gateway_mac, arp + 8, 6);
     printf("ARP reply: gateway MAC %02X:%02X:%02X:%02X:%02X:%02X\n",
            gateway_mac[0], gateway_mac[1], gateway_mac[2], gateway_mac[3], gateway_mac[4], gateway_mac[5]);
+    return true;
+}
+
+static bool inspect_icmp_echo_reply(const u8 *packet, u32 packet_size, const DhcpLease *lease) {
+    if (packet_size < RNDIS_PACKET_HEADER_SIZE) return false;
+    u32 data_offset = 8 + get_le32(packet + 8);
+    u32 data_length = get_le32(packet + 12);
+    if (get_le32(packet) != RNDIS_PACKET_MSG || data_offset > packet_size ||
+        data_length > packet_size - data_offset || data_length < 14 + 20 + 8) return false;
+    const u8 *ethernet = packet + data_offset;
+    if (get_be16(ethernet + 12) != 0x0800) return false;
+    const u8 *ipv4 = ethernet + 14;
+    u8 ihl = (ipv4[0] & 0x0f) * 4;
+    if (ihl < 20 || data_length < (u32)(14 + ihl + 8) || ipv4[9] != 1 ||
+        memcmp(ipv4 + 12, lease->router, 4) != 0 || memcmp(ipv4 + 16, lease->address, 4) != 0) return false;
+    const u8 *icmp = ipv4 + ihl;
+    if (icmp[0] != 0 || icmp[1] != 0 || get_be16(icmp + 4) != 0x4e58 || get_be16(icmp + 6) != 1) return false;
+    printf("ICMP echo reply received from DHCP router.\n");
     return true;
 }
 
@@ -1046,9 +1100,9 @@ static void probe_dhcp_discover(void) {
     rc = usbHsEpPostBuffer(&output_endpoint, tx_buffer, discover_size, &transferred);
     log_transfer_result("DHCPDISCOVER bulk send", rc, transferred);
     if (R_FAILED(rc) || transferred != discover_size) goto cleanup;
-    printf("DHCPDISCOVER sent; waiting up to 8 seconds for DHCPOFFER.\n");
+    printf("DHCPDISCOVER sent; waiting up to 12 seconds for DHCPOFFER.\n");
     bool got_offer = false;
-    for (int attempt = 0; attempt < 4; attempt++) {
+    for (int attempt = 0; attempt < 6; attempt++) {
         rc = eventWait(usbHsEpGetXferEvent(&input_endpoint), 2000000000ULL);
         log_result("DHCP receive wait", rc);
         if (R_FAILED(rc)) continue;
@@ -1072,11 +1126,18 @@ static void probe_dhcp_discover(void) {
             break;
         }
 
+        if (attempt == 1 || attempt == 3) {
+            transferred = 0;
+            rc = usbHsEpPostBuffer(&output_endpoint, tx_buffer, discover_size, &transferred);
+            log_transfer_result("DHCPDISCOVER retry send", rc, transferred);
+            if (R_FAILED(rc) || transferred != discover_size) goto cleanup;
+            printf("Retrying DHCPDISCOVER after unrelated traffic.\n");
+        }
         printf("Reposting receive for the next frame.\n");
         rc = usbHsEpPostBufferAsync(&input_endpoint, rx_buffer, 0x1000, (u64)(attempt + 2), &xfer_id);
         log_result("DHCP repost receive", rc);
         if (R_FAILED(rc)) break;
-        if (attempt == 3) printf("No DHCPOFFER before timeout.\n");
+        if (attempt == 5) printf("No DHCPOFFER before timeout.\n");
     }
     if (!got_offer) goto cleanup;
 
@@ -1165,6 +1226,41 @@ static void probe_dhcp_discover(void) {
         if (R_FAILED(rc)) break;
     }
     if (!got_arp) printf("No matching gateway ARP reply before timeout.\n");
+    if (!got_arp) goto cleanup;
+
+    rc = usbHsEpPostBufferAsync(&input_endpoint, rx_buffer, 0x1000, 48, &xfer_id);
+    log_result("ICMP post receive", rc); if (R_FAILED(rc)) goto cleanup;
+    size_t icmp_size = build_icmp_echo_request(tx_buffer, mac, &lease, gateway_mac);
+    transferred = 0;
+    rc = usbHsEpPostBuffer(&output_endpoint, tx_buffer, icmp_size, &transferred);
+    log_transfer_result("ICMP gateway echo send", rc, transferred);
+    if (R_FAILED(rc) || transferred != icmp_size) goto cleanup;
+    print_ipv4("ICMP echo sent to DHCP router ", lease.router);
+    printf("; waiting up to 4 seconds for reply.\n");
+    bool got_echo = false;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        rc = eventWait(usbHsEpGetXferEvent(&input_endpoint), 2000000000ULL);
+        log_result("ICMP receive wait", rc);
+        if (R_FAILED(rc)) continue;
+
+        UsbHsXferReport reports[2];
+        eventClear(usbHsEpGetXferEvent(&input_endpoint));
+        report_count = 0;
+        rc = usbHsEpGetXferReport(&input_endpoint, reports, 2, &report_count);
+        log_result("ICMP receive report", rc);
+        if (R_FAILED(rc) || report_count == 0) continue;
+        printf("ICMP bulk receive: result=0x%08X bytes=%u\n", reports[0].res, reports[0].transferredSize);
+        if (R_FAILED(reports[0].res)) break;
+        if (inspect_icmp_echo_reply(rx_buffer, reports[0].transferredSize, &lease)) {
+            got_echo = true;
+            break;
+        }
+        printf("Frame was not the requested ICMP echo reply; reposting receive.\n");
+        rc = usbHsEpPostBufferAsync(&input_endpoint, rx_buffer, 0x1000, (u64)(49 + attempt), &xfer_id);
+        log_result("ICMP repost receive", rc);
+        if (R_FAILED(rc)) break;
+    }
+    if (!got_echo) printf("No matching ICMP echo reply before timeout.\n");
 
 cleanup:
     if (output_open) usbHsEpClose(&output_endpoint);

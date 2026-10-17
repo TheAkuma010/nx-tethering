@@ -23,9 +23,10 @@
 - [x] Phase 5 (implementation): add DHCPREQUEST/DHCPACK validation without yet applying the lease to a Switch network stack.
 - [x] Phase 5 (physical validation): receive DHCPACK for the selected S23 offer; do not configure the lease on Horizon.
 - [x] Phase 6 (implementation): parse DHCPACK mask/router/DNS/lease parameters and send a bounded ARP probe for the DHCP router.
-- [ ] Phase 6 (physical validation): receive the matching ARP reply for the DHCP router.
-- [ ] Phase 6-7: introduce retained DHCP parameters to a homebrew-only IPv4 stack, then test ICMP, DNS, and external connectivity.
-- [ ] Phase 5-6: apply an accepted lease to a homebrew IP stack, then test DNS and external connectivity.
+- [x] Phase 6 (physical validation): receive the matching ARP reply for the DHCP router.
+- [x] Phase 7 (implementation): send one validated ICMP echo request to the resolved DHCP router.
+- [ ] Phase 7 (physical validation): receive the matching ICMP echo reply from the DHCP router.
+- [ ] Phase 8: introduce retained DHCP parameters to a homebrew-only IPv4 stack, then test DNS and external connectivity.
 - [ ] Phase 7: only after successful homebrew networking, investigate a constrained Atmosphere sysmodule prototype.
 
 ## Acceptance criteria for the current artifact

@@ -33,6 +33,10 @@ The physical S23 run of version 0.7.0 completed that exchange: it logged `DHCPRE
 
 Version 0.8.0 parses the DHCPACK options needed for a later homebrew IPv4 stack (subnet mask, router, DNS, and lease time). If a router option is present, it sends exactly one ARP request for that router and accepts only a reply whose sender protocol address is the router and whose target protocol address is the DHCPACK address. No IP address is installed and no IP packet is sent in this phase.
 
+The two initial physical 0.8.0 attempts received valid RNDIS IPv6 multicast frames but no DHCPOFFER before the eight-second window. Version 0.8.1 keeps the same bounded diagnostic but retransmits DHCPDISCOVER twice after completed, unrelated receives and extends only the discovery wait to twelve seconds. This accommodates a delayed Android DHCP service without treating the IPv6 traffic as failure or proceeding to ARP without a DHCPACK.
+
+The subsequent 0.8.1 physical test completed the full guarded path: it obtained `10.248.48.177`, mask `255.255.255.0`, router/DNS `10.248.48.125`, and a 3599-second lease; it then received a matching ARP reply from the requested router. Version 0.9.0 uses that resolved MAC only to emit one ICMP echo request to the local DHCP router, accepting a reply only when IPv4 source/destination and ICMP identifier/sequence match. It does not contact an external address.
+
 ## Alternatives considered
 
 | Candidate | What must be seen in Phase 2 | Decision status |
